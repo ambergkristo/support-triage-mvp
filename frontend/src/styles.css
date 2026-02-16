@@ -1,0 +1,94 @@
+:root {
+  color-scheme: light;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.4;
+  font-weight: 400;
+  color: #18212b;
+  background: #f3f6f8;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+.app-shell {
+  min-height: 100vh;
+}
+
+.topbar {
+  align-items: center;
+  background: #fff;
+  border-bottom: 1px solid #dce3ea;
+  display: flex;
+  gap: 1rem;
+  justify-content: space-between;
+  padding: 1rem 1.25rem;
+}
+
+.topbar h1 {
+  font-size: 1.1rem;
+  margin: 0;
+}
+
+.topbar nav {
+  display: flex;
+  gap: 1rem;
+}
+
+.topbar a {
+  color: #0056d6;
+  text-decoration: none;
+}
+
+.content {
+  margin: 0 auto;
+  max-width: 900px;
+  padding: 1.25rem;
+}
+
+.card {
+  background: #fff;
+  border: 1px solid #dce3ea;
+  border-radius: 10px;
+  margin-bottom: 1rem;
+  padding: 1rem;
+}
+
+.message-list {
+  display: grid;
+  gap: 1rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+button {
+  background: #0056d6;
+  border: 0;
+  border-radius: 8px;
+  color: #fff;
+  cursor: pointer;
+  font-size: 0.95rem;
+  padding: 0.6rem 1rem;
+}
+
+button:disabled {
+  background: #7fa9ea;
+  cursor: not-allowed;
+}
+
+.error {
+  color: #b11616;
+}
+
+pre {
+  background: #f7f9fc;
+  border: 1px solid #dce3ea;
+  border-radius: 8px;
+  overflow-x: auto;
+  padding: 0.75rem;
+}
