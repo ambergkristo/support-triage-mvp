@@ -1,0 +1,12 @@
+﻿# secrets
+**/.env
+**/credentials.json
+**/token*.json
+
+# node
+**/node_modules
+**/dist
+**/.DS_Store
+
+# logs
+**/*.log
