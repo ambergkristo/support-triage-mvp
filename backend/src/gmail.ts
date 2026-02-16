@@ -42,11 +42,7 @@ export async function listEmailMetas(maxResults: number = 10) {
                 format: "metadata",
                 metadataHeaders: ["Subject", "From", "Date"],
             });
-
-            const headers = msg.data.payload?.headers ?? [];
-            const getHeader = (name: string) =>
-                headers.find((h) => h.name?.toLowerCase() === name.toLowerCase())
-                    ?.value ?? "";
+            const getHeader = createHeaderGetter(msg.data.payload?.headers ?? []);
 
             return {
                 id: msg.data.id ?? "",
@@ -60,4 +56,34 @@ export async function listEmailMetas(maxResults: number = 10) {
     );
 
     return metas;
+}
+
+function createHeaderGetter(
+    headers: Array<{ name?: string | null; value?: string | null }>
+) {
+    return (name: string) =>
+        headers.find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value ??
+        "";
+}
+
+export async function getEmailMetaById(messageId: string) {
+    const gmail = google.gmail({ version: "v1", auth: oAuth2Client });
+
+    const msg = await gmail.users.messages.get({
+        userId: "me",
+        id: messageId,
+        format: "metadata",
+        metadataHeaders: ["Subject", "From", "Date"],
+    });
+
+    const getHeader = createHeaderGetter(msg.data.payload?.headers ?? []);
+
+    return {
+        id: msg.data.id ?? messageId,
+        threadId: msg.data.threadId ?? "",
+        snippet: msg.data.snippet ?? "",
+        subject: getHeader("Subject"),
+        from: getHeader("From"),
+        date: getHeader("Date"),
+    };
 }
