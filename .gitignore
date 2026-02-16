@@ -10,3 +10,7 @@
 
 # logs
 **/*.log
+# secrets
+**/.env
+**/credentials.json
+**/token*.json
