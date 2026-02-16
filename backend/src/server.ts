@@ -37,22 +37,25 @@ app.get("/oauth2callback", async (req, res) => {
     }
 });
 
+const missingApiKeyMessage =
+    "OPENAI_API_KEY missing. Add OPENAI_API_KEY to backend/.env.";
+
 app.get("/triage", async (req, res) => {
     const querySchema = z.object({
         limit: z.coerce.number().int().min(1).max(50).default(10),
     });
 
     try {
+        if (!process.env.OPENAI_API_KEY?.trim()) {
+            return res.status(500).json({ error: missingApiKeyMessage });
+        }
+
         const hasOAuthCredentials =
             Object.keys(oAuth2Client.credentials ?? {}).length > 0;
         if (!hasOAuthCredentials) {
             return res.status(401).json({
                 error: "OAuth not completed. Authenticate via /auth/google first.",
             });
-        }
-
-        if (!process.env.OPENAI_API_KEY) {
-            return res.status(500).json({ error: "OPENAI_API_KEY missing" });
         }
 
         const { limit } = querySchema.parse(req.query);
@@ -80,8 +83,8 @@ app.get("/triage", async (req, res) => {
             return res.status(400).json({ error: "Invalid limit query parameter" });
         }
 
-        if (err?.message === "OPENAI_API_KEY missing") {
-            return res.status(500).json({ error: "OPENAI_API_KEY missing" });
+        if (err?.message === missingApiKeyMessage) {
+            return res.status(500).json({ error: missingApiKeyMessage });
         }
 
         return res.status(500).json({ error: err?.message ?? "Triage failed" });

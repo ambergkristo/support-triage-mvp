@@ -1,6 +1,7 @@
 # secrets
 .env
 credentials.json
+token*.json
 .data/
 
 # node

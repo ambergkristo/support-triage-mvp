@@ -30,9 +30,11 @@ export type EmailTriage = z.infer<typeof triageSchema>;
 let openai: OpenAI | null = null;
 
 function getOpenAIClient() {
-    const apiKey = process.env.OPENAI_API_KEY;
+    const apiKey = process.env.OPENAI_API_KEY?.trim();
     if (!apiKey) {
-        throw new Error("OPENAI_API_KEY missing");
+        throw new Error(
+            "OPENAI_API_KEY missing. Add OPENAI_API_KEY to backend/.env."
+        );
     }
 
     if (!openai) {
