@@ -12,8 +12,17 @@ app.use(express.json());
 
 const PORT = Number(process.env.PORT ?? 3000);
 
+function hasGoogleOAuthCredentials() {
+    const creds = oAuth2Client.credentials;
+    return Boolean(creds?.access_token || creds?.refresh_token);
+}
+
 app.get("/", (req, res) => {
     res.json({ status: "API running" });
+});
+
+app.get("/health", (req, res) => {
+    res.json({ status: "ok" });
 });
 
 app.get("/auth/google", (req, res) => {
@@ -36,14 +45,24 @@ app.get("/oauth2callback", async (req, res) => {
     }
 });
 
-app.post("/triage", async (req, res) => {
+app.get("/triage", async (req, res) => {
     try {
-        const emails = await listEmailMetas(10);
+        if (!hasGoogleOAuthCredentials()) {
+            return res
+                .status(401)
+                .json({ error: "Not authenticated with Google OAuth" });
+        }
 
-        const results = await Promise.all(
+        const rawLimit = req.query.limit as string | undefined;
+        const parsedLimit = rawLimit ? Number(rawLimit) : 10;
+        const limit = Number.isInteger(parsedLimit) && parsedLimit > 0 ? parsedLimit : 10;
+
+        const emails = await listEmailMetas(limit);
+
+        const items = await Promise.all(
             emails.map(async (e) => ({
-                ...e,
-                analysis: await analyzeEmail({
+                email: e,
+                triage: await analyzeEmail({
                     subject: e.subject,
                     from: e.from,
                     snippet: e.snippet,
@@ -51,8 +70,13 @@ app.post("/triage", async (req, res) => {
             }))
         );
 
-        res.json({ results });
+        res.json({ message: "ok", items });
     } catch (err: any) {
+        if (err?.status === 401 || err?.code === 401) {
+            return res
+                .status(401)
+                .json({ error: "Not authenticated with Google OAuth" });
+        }
         res.status(500).json({ error: err?.message ?? "Triage failed" });
     }
 });

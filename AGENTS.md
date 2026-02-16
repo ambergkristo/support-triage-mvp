@@ -6,7 +6,8 @@
 - Use `chore/*` for maintenance, docs, tooling, and CI updates.
 
 ## Pull Request Checklist
-- [ ] No secrets are committed (`backend/.env`, `credentials.json`, tokens, API keys, `sk-` keys).
+- [ ] No real secret files are committed (`backend/.env`, `credentials.json`, `token.json`).
+- [ ] Template/example files are allowed (for example `*.example`, `*.env.example`, `credentials.example.json`).
 - [ ] Relevant commands were run locally (at minimum backend install + typecheck/build path).
 - [ ] Include proof of validation in the PR description:
   - command outputs or log snippets

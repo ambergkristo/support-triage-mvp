@@ -14,6 +14,8 @@ Local MVP that:
    cd backend
    npm install
    npm run dev
+   If `npm run dev` fails on Windows (EPERM/spawn issues), use:
+   npm run dev:safe
 
 3. OAuth flow:
    Open http://localhost:3000/auth/google
