@@ -1,7 +1,10 @@
 # secrets
 .env
 credentials.json
-.data/
+data/
+token.json
+data/token.json
+*token*.json
 
 # node
 node_modules
