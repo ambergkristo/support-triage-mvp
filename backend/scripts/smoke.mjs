@@ -4,7 +4,8 @@ const quotaText = "You exceeded your current quota";
 
 function fail(message) {
     console.error(`FAIL: ${message}`);
-    process.exit(1);
+    process.exitCode = 1;
+    throw new Error(message);
 }
 
 function pass(message) {
@@ -69,7 +70,6 @@ try {
     pass(`/triage returned ${triage.status} and no quota text`);
 
     console.log("SMOKE PASS");
-    process.exit(0);
 } catch (err) {
     fail(err instanceof Error ? err.message : String(err));
 }
