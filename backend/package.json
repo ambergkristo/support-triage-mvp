@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "dev:safe": "ts-node --transpile-only src/server.ts",
-    "test": "node scripts/run-tests.js"
+    "test": "node scripts/run-tests.js",
+    "smoke": "node scripts/smoke.mjs"
   },
   "keywords": [],
   "author": "",
