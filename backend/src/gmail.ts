@@ -2,17 +2,29 @@ import { google } from "googleapis";
 import fs from "fs";
 import path from "path";
 import type { gmail_v1 } from "googleapis";
+import type { Credentials } from "google-auth-library";
 
-const credentialsPath = path.join(process.cwd(), "credentials.json");
-const credentials = JSON.parse(fs.readFileSync(credentialsPath, "utf-8"));
+type WebCredentials = {
+    client_secret: string;
+    client_id: string;
+    redirect_uris: string[];
+};
 
-const { client_secret, client_id, redirect_uris } = credentials.web;
+function loadWebCredentials(): WebCredentials {
+    const realPath = path.join(process.cwd(), "credentials.json");
+    const examplePath = path.join(process.cwd(), "credentials.example.json");
+    const filePath = fs.existsSync(realPath) ? realPath : examplePath;
+    if (!fs.existsSync(filePath)) {
+        throw new Error("Missing OAuth credentials file (credentials.json)");
+    }
+    const credentials = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    return credentials.web as WebCredentials;
+}
 
-export const oAuth2Client = new google.auth.OAuth2(
-    client_id,
-    client_secret,
-    redirect_uris[0]
-);
+function createOAuth2Client() {
+    const { client_secret, client_id, redirect_uris } = loadWebCredentials();
+    return new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
+}
 
 export const SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"];
 
@@ -36,11 +48,32 @@ export type EmailDetail = EmailMeta & {
 };
 
 export function getAuthUrl() {
+    const oAuth2Client = createOAuth2Client();
     return oAuth2Client.generateAuthUrl({
         access_type: "offline",
         prompt: "consent",
         scope: SCOPES,
     });
+}
+
+export async function exchangeCodeForTokens(code: string): Promise<Credentials> {
+    const oAuth2Client = createOAuth2Client();
+    const { tokens } = await oAuth2Client.getToken(code);
+    return tokens;
+}
+
+export async function getGoogleUserEmail(tokens: Credentials): Promise<string> {
+    const oAuth2Client = createOAuth2Client();
+    oAuth2Client.setCredentials(tokens);
+    const oauth2 = google.oauth2({ version: "v2", auth: oAuth2Client });
+    const profile = await oauth2.userinfo.get();
+    return profile.data.email ?? "";
+}
+
+function createGmailClient(tokens: Credentials) {
+    const oAuth2Client = createOAuth2Client();
+    oAuth2Client.setCredentials(tokens);
+    return google.gmail({ version: "v1", auth: oAuth2Client });
 }
 
 function getHeaderValue(headers: gmail_v1.Schema$MessagePartHeader[] | undefined, name: string): string {
@@ -84,8 +117,12 @@ export function extractPlainTextFromPayload(payload: gmail_v1.Schema$MessagePart
     return "";
 }
 
-export async function listEmailMetasPage(maxResults: number = 10, pageToken?: string): Promise<EmailMetaPage> {
-    const gmail = google.gmail({ version: "v1", auth: oAuth2Client });
+export async function listEmailMetasPage(
+    tokens: Credentials,
+    maxResults: number = 10,
+    pageToken?: string
+): Promise<EmailMetaPage> {
+    const gmail = createGmailClient(tokens);
 
     const list = await gmail.users.messages.list({
         userId: "me",
@@ -127,12 +164,16 @@ export async function listEmailMetasPage(maxResults: number = 10, pageToken?: st
 }
 
 export async function listEmailMetas(maxResults: number = 10): Promise<EmailMeta[]> {
-    const page = await listEmailMetasPage(maxResults);
+    throw new Error(`Deprecated call listEmailMetas(${maxResults})`);
+}
+
+export async function listEmailMetasForUser(tokens: Credentials, maxResults: number = 10): Promise<EmailMeta[]> {
+    const page = await listEmailMetasPage(tokens, maxResults);
     return page.items;
 }
 
-export async function getEmailDetail(id: string): Promise<EmailDetail> {
-    const gmail = google.gmail({ version: "v1", auth: oAuth2Client });
+export async function getEmailDetail(tokens: Credentials, id: string): Promise<EmailDetail> {
+    const gmail = createGmailClient(tokens);
     const msg = await gmail.users.messages.get({
         userId: "me",
         id,

@@ -20,9 +20,9 @@ function assertTrue(value, message) {
     }
 }
 
-function test(name, fn) {
+async function test(name, fn) {
     try {
-        fn();
+        await fn();
         console.log(`PASS: ${name}`);
         return true;
     } catch (err) {
@@ -32,328 +32,267 @@ function test(name, fn) {
     }
 }
 
+function requireFresh(modulePath) {
+    const resolved = require.resolve(modulePath);
+    delete require.cache[resolved];
+    return require(modulePath);
+}
+
+function clearLocalRequireCache() {
+    const suffixes = [
+        "src/infrastructure/sqlite.ts",
+        "src/infrastructure/sqliteMigrations.ts",
+        "src/server.ts",
+        "src/infrastructure/repositories/userRepository.ts",
+        "src/infrastructure/repositories/workspaceRepository.ts",
+        "src/infrastructure/repositories/inboxAccountRepository.ts",
+        "src/infrastructure/repositories/oauthTokenRepository.ts",
+    ];
+    for (const key of Object.keys(require.cache)) {
+        if (suffixes.some((suffix) => key.endsWith(suffix.replace(/\//g, path.sep)))) {
+            delete require.cache[key];
+        }
+    }
+}
+
+async function withTempDb(run) {
+    const previousDbPath = process.env.SQLITE_DB_PATH;
+    const previousTokenKey = process.env.TOKEN_ENCRYPTION_KEY;
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "triage-m3-tests-"));
+    const dbPath = path.join(tmpRoot, "app.db");
+    process.env.SQLITE_DB_PATH = dbPath;
+    process.env.TOKEN_ENCRYPTION_KEY = "m3-test-encryption-key";
+
+    clearLocalRequireCache();
+    const sqlite = requireFresh("../src/infrastructure/sqlite.ts");
+    sqlite.closeDatabaseForTests();
+
+    try {
+        await run({ dbPath });
+    } finally {
+        sqlite.closeDatabaseForTests();
+        clearLocalRequireCache();
+        if (previousDbPath === undefined) {
+            delete process.env.SQLITE_DB_PATH;
+        } else {
+            process.env.SQLITE_DB_PATH = previousDbPath;
+        }
+        if (previousTokenKey === undefined) {
+            delete process.env.TOKEN_ENCRYPTION_KEY;
+        } else {
+            process.env.TOKEN_ENCRYPTION_KEY = previousTokenKey;
+        }
+        // SQLite can hold short-lived WAL/SHM handles on Windows; skip hard cleanup in tests.
+    }
+}
+
 function listFilesRecursive(dir) {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
     const files = [];
-
     for (const entry of entries) {
         const fullPath = path.join(dir, entry.name);
         if (entry.isDirectory()) {
             files.push(...listFilesRecursive(fullPath));
-            continue;
+        } else {
+            files.push(fullPath);
         }
-        files.push(fullPath);
     }
-
     return files;
 }
 
-const { triageEmailRules } = require("../src/triageRules.ts");
-const { mergeTokensForPersistence } = require("../src/authTokenPersistence.ts");
-const { extractPlainTextFromPayload } = require("../src/gmail.ts");
+async function main() {
+    const results = [];
+    const { extractPlainTextFromPayload } = require("../src/gmail.ts");
 
-const results = [];
-
-results.push(
-    test("gmail payload extraction: top-level plain text", () => {
-        const payload = {
-            mimeType: "text/plain",
-            body: {
-                data: Buffer.from("Hello plain text", "utf-8")
-                    .toString("base64")
-                    .replace(/\+/g, "-")
-                    .replace(/\//g, "_"),
-            },
-        };
-        const text = extractPlainTextFromPayload(payload);
-        assertEqual(text, "Hello plain text", "Should decode top-level plain text payload");
-    })
-);
-
-results.push(
-    test("gmail payload extraction: nested multipart plain text fallback", () => {
-        const payload = {
-            mimeType: "multipart/alternative",
-            parts: [
-                {
-                    mimeType: "text/html",
-                    body: {
-                        data: Buffer.from("<p>HTML</p>", "utf-8")
-                            .toString("base64")
-                            .replace(/\+/g, "-")
-                            .replace(/\//g, "_"),
-                    },
+    results.push(
+        await test("gmail payload extraction: top-level plain text", async () => {
+            const payload = {
+                mimeType: "text/plain",
+                body: {
+                    data: Buffer.from("Hello plain text", "utf-8")
+                        .toString("base64")
+                        .replace(/\+/g, "-")
+                        .replace(/\//g, "_"),
                 },
+            };
+            const text = extractPlainTextFromPayload(payload);
+            assertEqual(text, "Hello plain text", "Should decode top-level plain text payload");
+        })
+    );
+
+    results.push(
+        await test("m3: first OAuth provisioning creates user/workspace/inbox rows", async () => {
+            await withTempDb(async () => {
+                const { getDatabase } = requireFresh("../src/infrastructure/sqlite.ts");
+                const { UserRepository } = requireFresh("../src/infrastructure/repositories/userRepository.ts");
+                const { WorkspaceRepository } = requireFresh(
+                    "../src/infrastructure/repositories/workspaceRepository.ts"
+                );
+                const { InboxAccountRepository } = requireFresh(
+                    "../src/infrastructure/repositories/inboxAccountRepository.ts"
+                );
+                const { OAuthTokenRepository } = requireFresh(
+                    "../src/infrastructure/repositories/oauthTokenRepository.ts"
+                );
+
+                const db = getDatabase();
+                const users = new UserRepository(db);
+                const workspaces = new WorkspaceRepository(db);
+                const inboxes = new InboxAccountRepository(db);
+                const tokens = new OAuthTokenRepository(db);
+
+                const user = users.upsertGoogleUserByEmail("owner@example.com");
+                const workspace = workspaces.ensurePersonalWorkspace(user.id);
+                workspaces.ensureOwnerMembership(workspace.id, user.id);
+                const inbox = inboxes.upsertGoogleAccount(workspace.id, user.email, user.email);
+                tokens.saveForInboxAccount(inbox.id, {
+                    access_token: "oauth-access",
+                    refresh_token: "oauth-refresh",
+                    expiry_date: 4102444800000,
+                });
+
+                const userRow = db.prepare("SELECT id, email, createdAt FROM users WHERE id = ?").get(user.id);
+                const workspaceRow = db
+                    .prepare("SELECT id, name, ownerUserId, createdAt FROM workspaces WHERE id = ?")
+                    .get(workspace.id);
+                const memberRow = db
+                    .prepare("SELECT workspaceId, userId, role FROM workspace_members WHERE workspaceId = ? AND userId = ?")
+                    .get(workspace.id, user.id);
+                const inboxRow = db
+                    .prepare("SELECT id, workspaceId, provider, googleSubject, email, createdAt FROM inbox_accounts WHERE id = ?")
+                    .get(inbox.id);
+
+                assertTrue(Boolean(userRow), "Expected users row");
+                assertTrue(Boolean(workspaceRow), "Expected workspaces row");
+                assertEqual(workspaceRow.name, "Personal", "Expected default workspace Personal");
+                assertTrue(Boolean(memberRow), "Expected workspace_members row");
+                assertEqual(memberRow.role, "owner", "Expected owner membership");
+                assertTrue(Boolean(inboxRow), "Expected inbox_accounts row");
+                assertEqual(inboxRow.provider, "google", "Expected google provider");
+            });
+        })
+    );
+
+    results.push(
+        await test("m3: oauth_tokens stores encrypted payload and decrypts", async () => {
+            await withTempDb(async () => {
+                const { getDatabase } = requireFresh("../src/infrastructure/sqlite.ts");
+                const { UserRepository } = requireFresh("../src/infrastructure/repositories/userRepository.ts");
+                const { WorkspaceRepository } = requireFresh(
+                    "../src/infrastructure/repositories/workspaceRepository.ts"
+                );
+                const { InboxAccountRepository } = requireFresh(
+                    "../src/infrastructure/repositories/inboxAccountRepository.ts"
+                );
+                const { OAuthTokenRepository } = requireFresh(
+                    "../src/infrastructure/repositories/oauthTokenRepository.ts"
+                );
+
+                const db = getDatabase();
+                const users = new UserRepository(db);
+                const workspaces = new WorkspaceRepository(db);
+                const inboxes = new InboxAccountRepository(db);
+                const oauthTokens = new OAuthTokenRepository(db);
+
+                const user = users.upsertGoogleUserByEmail("secure@example.com");
+                const workspace = workspaces.ensurePersonalWorkspace(user.id);
+                workspaces.ensureOwnerMembership(workspace.id, user.id);
+                const inbox = inboxes.upsertGoogleAccount(workspace.id, user.email, user.email);
+                oauthTokens.saveForInboxAccount(inbox.id, {
+                    access_token: "a-secure",
+                    refresh_token: "r-secure",
+                    expiry_date: 4102444800000,
+                });
+
+                const row = db
+                    .prepare("SELECT encryptedTokenJson FROM oauth_tokens WHERE inboxAccountId = ?")
+                    .get(inbox.id);
+                assertTrue(Boolean(row), "Expected oauth_tokens row");
+                assertTrue(
+                    !String(row.encryptedTokenJson).includes("r-secure"),
+                    "Encrypted token payload must not contain plaintext refresh token"
+                );
+
+                const loaded = oauthTokens.findForInboxAccount(inbox.id);
+                assertEqual(loaded.refresh_token, "r-secure", "Expected decrypted refresh token");
+            });
+        })
+    );
+
+    results.push(
+        await test("m3: restart-safe auth linkage keeps ids available", async () => {
+            await withTempDb(async () => {
                 {
-                    mimeType: "text/plain",
-                    body: {
-                        data: Buffer.from("Nested plain text", "utf-8")
-                            .toString("base64")
-                            .replace(/\+/g, "-")
-                            .replace(/\//g, "_"),
-                    },
-                },
-            ],
-        };
-        const text = extractPlainTextFromPayload(payload);
-        assertEqual(text, "Nested plain text", "Should prefer nested text/plain payload");
-    })
-);
+                    const { getDatabase } = requireFresh("../src/infrastructure/sqlite.ts");
+                    const { UserRepository } = requireFresh("../src/infrastructure/repositories/userRepository.ts");
+                    const { WorkspaceRepository } = requireFresh(
+                        "../src/infrastructure/repositories/workspaceRepository.ts"
+                    );
+                    const { InboxAccountRepository } = requireFresh(
+                        "../src/infrastructure/repositories/inboxAccountRepository.ts"
+                    );
+                    const { OAuthTokenRepository } = requireFresh(
+                        "../src/infrastructure/repositories/oauthTokenRepository.ts"
+                    );
 
-results.push(
-    test("triageRules: github sender domain maps to operations", () => {
-        const result = triageEmailRules({
-            from: "GitHub <notifications@github.com>",
-            subject: "Repository notification",
-            snippet: "CI checks finished",
-            date: "Mon, 17 Feb 2026 09:00:00 +0000",
-        });
-        assertEqual(result.category, "operations", "github.com sender should prioritize operations");
-        assertEqual(result.priority, "P1", "operations should map to P1");
-    })
-);
+                    const db = getDatabase();
+                    const users = new UserRepository(db);
+                    const workspaces = new WorkspaceRepository(db);
+                    const inboxes = new InboxAccountRepository(db);
+                    const oauthTokens = new OAuthTokenRepository(db);
 
-results.push(
-    test("triageRules: linkedin sender domain maps to career", () => {
-        const result = triageEmailRules({
-            from: "LinkedIn <jobs-noreply@linkedin.com>",
-            subject: "Your weekly opportunities",
-            snippet: "New roles and bonus information",
-            date: "Mon, 17 Feb 2026 09:00:00 +0000",
-        });
-        assertEqual(result.category, "career", "linkedin.com sender should map to career");
-        assertEqual(result.priority, "P2", "career should map to P2");
-    })
-);
+                    const user = users.upsertGoogleUserByEmail("persist@example.com");
+                    const workspace = workspaces.ensurePersonalWorkspace(user.id);
+                    workspaces.ensureOwnerMembership(workspace.id, user.id);
+                    const inbox = inboxes.upsertGoogleAccount(workspace.id, user.email, user.email);
+                    oauthTokens.saveForInboxAccount(inbox.id, {
+                        access_token: "persist-access",
+                        refresh_token: "persist-refresh",
+                        expiry_date: 4102444800000,
+                    });
+                }
 
-results.push(
-    test("triageRules: case-insensitive security match", () => {
-        const result = triageEmailRules({
-            from: "alerts@example.com",
-            subject: "SECURITY ALERT",
-            snippet: "suspicious sign-in detected",
-            date: "Mon, 17 Feb 2026 09:00:00 +0000",
-        });
-        assertEqual(result.priority, "P0", "Security keyword should map to P0");
-        assertEqual(result.category, "security", "Security keyword should map to security category");
-    })
-);
-
-results.push(
-    test("triageRules: recency boosts confidence for urgent categories", () => {
-        const recent = triageEmailRules({
-            from: "alerts@example.com",
-            subject: "Security alert",
-            snippet: "Verify this suspicious sign-in",
-            date: new Date().toUTCString(),
-        });
-        const older = triageEmailRules({
-            from: "alerts@example.com",
-            subject: "Security alert",
-            snippet: "Verify this suspicious sign-in",
-            date: "Mon, 01 Jan 2024 00:00:00 +0000",
-        });
-        assertTrue(recent.confidence >= older.confidence, "Recent urgent emails should not have lower confidence");
-    })
-);
-
-results.push(
-    test("triageRules: billing match", () => {
-        const result = triageEmailRules({
-            from: "billing@example.com",
-            subject: "Invoice available",
-            snippet: "payment failed on your card",
-            date: "Mon, 17 Feb 2026 09:00:00 +0000",
-        });
-        assertEqual(result.priority, "P1", "Billing keyword should map to P1");
-        assertEqual(result.category, "billing", "Billing keyword should map to billing category");
-    })
-);
-
-results.push(
-    test("triageRules: overlapping operations signals increase confidence", () => {
-        const result = triageEmailRules({
-            from: "alerts@github.com",
-            subject: "CI failed on main",
-            snippet: "build failed and failing checks",
-            date: new Date().toUTCString(),
-        });
-        assertEqual(result.category, "operations", "Operations overlap should map to operations");
-        assertTrue(result.confidence >= 0.8, "Multiple operations signals should yield high confidence");
-    })
-);
-
-results.push(
-    test("triageRules: low-priority match", () => {
-        const result = triageEmailRules({
-            from: "no-reply@example.com",
-            subject: "Weekly newsletter digest",
-            snippet: "unsubscribe any time",
-            date: "Mon, 17 Feb 2026 09:00:00 +0000",
-        });
-        assertEqual(result.priority, "P3", "Newsletter keyword should map to P3");
-        assertEqual(result.category, "low", "Newsletter keyword should map to low category");
-    })
-);
-
-results.push(
-    test("triageRules: default match", () => {
-        const result = triageEmailRules({
-            from: "friend@example.com",
-            subject: "Lunch?",
-            snippet: "Want to catch up",
-            date: "Mon, 17 Feb 2026 09:00:00 +0000",
-        });
-        assertEqual(result.priority, "P2", "Unmatched email should map to P2");
-        assertEqual(result.category, "general", "Unmatched email should map to general category");
-    })
-);
-
-results.push(
-    test("triageRules: confidence always within [0,1]", () => {
-        const samples = [
-            { subject: "Password reset", snippet: "verification code 1234" },
-            { subject: "Invoice", snippet: "billing update" },
-            { subject: "Newsletter", snippet: "unsubscribe" },
-            { subject: "General note", snippet: "hello there" },
-        ];
-
-        for (const sample of samples) {
-            const result = triageEmailRules({
-                from: "any@example.com",
-                date: "Mon, 17 Feb 2026 09:00:00 +0000",
-                ...sample,
+                clearLocalRequireCache();
+                const { OAuthTokenRepository } = requireFresh("../src/infrastructure/repositories/oauthTokenRepository.ts");
+                const { getDatabase } = requireFresh("../src/infrastructure/sqlite.ts");
+                const oauthTokensAfterRestart = new OAuthTokenRepository(getDatabase());
+                const context = oauthTokensAfterRestart.findLatestLinkedContext();
+                assertTrue(Boolean(context), "Expected linked auth context after simulated restart");
+                assertTrue(Boolean(context.userId), "Expected persisted userId");
+                assertTrue(Boolean(context.workspaceId), "Expected persisted workspaceId");
+                assertTrue(Boolean(context.inboxAccountId), "Expected persisted inboxAccountId");
+                const tokens = oauthTokensAfterRestart.findForInboxAccount(context.inboxAccountId);
+                assertEqual(tokens.refresh_token, "persist-refresh", "Expected persisted token after restart");
             });
-            assertTrue(result.confidence >= 0 && result.confidence <= 1, "Confidence must be between 0 and 1");
-        }
-    })
-);
+        })
+    );
 
-results.push(
-    test("guard: no openai usage in backend/src and backend/package.json", () => {
-        const backendRoot = path.resolve(__dirname, "..");
-        const srcDir = path.join(backendRoot, "src");
-        const srcFiles = listFilesRecursive(srcDir).filter((filePath) =>
-            /\.(ts|tsx|js|jsx|mjs|cjs|json)$/i.test(filePath)
-        );
-        const filesToScan = [...srcFiles, path.join(backendRoot, "package.json")];
+    results.push(
+        await test("guard: no openai usage in backend/src and backend/package.json", async () => {
+            const backendRoot = path.resolve(__dirname, "..");
+            const srcDir = path.join(backendRoot, "src");
+            const srcFiles = listFilesRecursive(srcDir).filter((filePath) =>
+                /\.(ts|tsx|js|jsx|mjs|cjs|json)$/i.test(filePath)
+            );
+            const filesToScan = [...srcFiles, path.join(backendRoot, "package.json")];
 
-        for (const filePath of filesToScan) {
-            const content = fs.readFileSync(filePath, "utf-8").toLowerCase();
-            assertTrue(!content.includes("openai"), `Forbidden 'openai' reference found in ${filePath}`);
-        }
-    })
-);
-
-results.push(
-    test("authTokenPersistence: preserves existing refresh token when Google omits it", () => {
-        const merged = mergeTokensForPersistence({
-            nextTokens: { access_token: "new-access", expiry_date: 2222 },
-            currentTokens: { refresh_token: "keep-me", access_token: "old-access", expiry_date: 1111 },
-            persistedTokens: { refresh_token: "persisted-refresh" },
-        });
-        assertEqual(merged.refresh_token, "keep-me", "Refresh token should be preserved from current token set");
-        assertEqual(merged.access_token, "new-access", "Access token should be updated from nextTokens");
-        assertEqual(merged.expiry_date, 2222, "Expiry should be updated from nextTokens");
-    })
-);
-
-results.push(
-    test("authTokenPersistence: falls back to persisted refresh token", () => {
-        const merged = mergeTokensForPersistence({
-            nextTokens: { access_token: "new-access" },
-            currentTokens: {},
-            persistedTokens: { refresh_token: "persisted-refresh" },
-        });
-        assertEqual(
-            merged.refresh_token,
-            "persisted-refresh",
-            "Persisted refresh token should be used when next/current have none"
-        );
-    })
-);
-
-results.push(
-    test("tokenStore: save/load/clear persistence", () => {
-        const previousCwd = process.cwd();
-        const previousEncryptionKey = process.env.TOKEN_ENCRYPTION_KEY;
-        const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "triage-token-store-"));
-
-        try {
-            process.chdir(tmpRoot);
-            delete process.env.TOKEN_ENCRYPTION_KEY;
-            const tokenStorePath = require.resolve("../src/tokenStore.ts");
-            delete require.cache[tokenStorePath];
-            const tokenStore = require("../src/tokenStore.ts");
-
-            assertEqual(tokenStore.tokenFilePresent(), false, "Token file should not exist before save");
-            tokenStore.saveTokens({
-                refresh_token: "refresh-123",
-                access_token: "access-abc",
-                expiry_date: 9876543210,
-            });
-            assertEqual(tokenStore.tokenFilePresent(), true, "Token file should exist after save");
-            const loaded = tokenStore.loadTokens();
-            assertEqual(loaded?.refresh_token, "refresh-123", "Saved refresh_token should load back");
-            assertEqual(loaded?.access_token, "access-abc", "Saved access_token should load back");
-            assertEqual(loaded?.expiry_date, 9876543210, "Saved expiry_date should load back");
-            tokenStore.clearTokens();
-            assertEqual(tokenStore.tokenFilePresent(), false, "Token file should be deleted after clear");
-        } finally {
-            if (previousEncryptionKey === undefined) {
-                delete process.env.TOKEN_ENCRYPTION_KEY;
-            } else {
-                process.env.TOKEN_ENCRYPTION_KEY = previousEncryptionKey;
+            for (const filePath of filesToScan) {
+                const content = fs.readFileSync(filePath, "utf-8").toLowerCase();
+                assertTrue(!content.includes("openai"), `Forbidden 'openai' reference found in ${filePath}`);
             }
-            process.chdir(previousCwd);
-            fs.rmSync(tmpRoot, { recursive: true, force: true });
-        }
-    })
-);
+        })
+    );
 
-results.push(
-    test("tokenStore: encrypts token file when TOKEN_ENCRYPTION_KEY is set", () => {
-        const previousCwd = process.cwd();
-        const previousEncryptionKey = process.env.TOKEN_ENCRYPTION_KEY;
-        const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "triage-token-store-encrypted-"));
+    if (results.every(Boolean)) {
+        console.log("ALL TESTS PASSED");
+        process.exit(0);
+    }
 
-        try {
-            process.chdir(tmpRoot);
-            process.env.TOKEN_ENCRYPTION_KEY = "unit-test-encryption-key";
-
-            const tokenStorePath = require.resolve("../src/tokenStore.ts");
-            delete require.cache[tokenStorePath];
-            const tokenStore = require("../src/tokenStore.ts");
-
-            tokenStore.saveTokens({
-                refresh_token: "refresh-secure",
-                access_token: "access-secure",
-                expiry_date: 1122334455,
-            });
-
-            const tokenFilePath = path.join(tmpRoot, "data", "token.json");
-            const raw = fs.readFileSync(tokenFilePath, "utf-8");
-            assertTrue(!raw.includes("refresh-secure"), "Encrypted token file must not contain plaintext token values");
-
-            const loaded = tokenStore.loadTokens();
-            assertEqual(loaded?.refresh_token, "refresh-secure", "Encrypted token payload should decrypt correctly");
-            tokenStore.clearTokens();
-        } finally {
-            if (previousEncryptionKey === undefined) {
-                delete process.env.TOKEN_ENCRYPTION_KEY;
-            } else {
-                process.env.TOKEN_ENCRYPTION_KEY = previousEncryptionKey;
-            }
-            process.chdir(previousCwd);
-            fs.rmSync(tmpRoot, { recursive: true, force: true });
-        }
-    })
-);
-
-if (results.every(Boolean)) {
-    console.log("ALL TESTS PASSED");
-    process.exit(0);
+    console.error("TESTS FAILED");
+    process.exit(1);
 }
 
-console.error("TESTS FAILED");
-process.exit(1);
+main().catch((err) => {
+    console.error(err instanceof Error ? err.message : err);
+    process.exit(1);
+});

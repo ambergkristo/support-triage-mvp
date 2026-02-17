@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "dev:safe": "ts-node --transpile-only src/server.ts",
+    "lint": "node scripts/lint.js",
     "test": "node scripts/run-tests.js",
     "smoke": "node scripts/smoke.mjs",
     "qa:restart-auth": "powershell -ExecutionPolicy Bypass -File ./scripts/check-restart-auth.ps1"
