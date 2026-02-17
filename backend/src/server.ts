@@ -3,12 +3,12 @@ import cors from "cors";
 import dotenv from "dotenv";
 import { getAuthUrl, oAuth2Client, listEmailMetas } from "./gmail";
 import { triageEmailRules } from "./triageRules";
+import { mergeTokensForPersistence } from "./authTokenPersistence";
 import {
     clearTokens,
     loadTokens,
     saveTokens,
     tokenFilePresent,
-    type GoogleTokens,
 } from "./tokenStore";
 
 dotenv.config();
@@ -23,22 +23,6 @@ const AUTH_ERROR = "Not authenticated with Google OAuth";
 function hasGoogleOAuthCredentials() {
     const creds = oAuth2Client.credentials;
     return Boolean(creds?.access_token || creds?.refresh_token);
-}
-
-function mergeTokensForPersistence(nextTokens: GoogleTokens): GoogleTokens {
-    const persisted = loadTokens();
-    const existingRefreshToken =
-        nextTokens.refresh_token ??
-        oAuth2Client.credentials.refresh_token ??
-        persisted?.refresh_token;
-
-    return {
-        ...oAuth2Client.credentials,
-        ...nextTokens,
-        ...(existingRefreshToken
-            ? { refresh_token: existingRefreshToken }
-            : {}),
-    };
 }
 
 const persistedTokens = loadTokens();
@@ -64,7 +48,11 @@ app.get("/oauth2callback", async (req, res) => {
         if (!code) return res.status(400).json({ error: "Missing code" });
 
         const { tokens } = await oAuth2Client.getToken(code);
-        const mergedTokens = mergeTokensForPersistence(tokens);
+        const mergedTokens = mergeTokensForPersistence({
+            nextTokens: tokens,
+            currentTokens: oAuth2Client.credentials,
+            persistedTokens: loadTokens(),
+        });
         oAuth2Client.setCredentials(mergedTokens);
         saveTokens(mergedTokens);
 

@@ -31,7 +31,11 @@ export function saveTokens(tokens: GoogleTokens): void {
 }
 
 export function clearTokens(): void {
-    if (fs.existsSync(tokenPath)) {
-        fs.unlinkSync(tokenPath);
+    try {
+        if (fs.existsSync(tokenPath)) {
+            fs.unlinkSync(tokenPath);
+        }
+    } catch {
+        // Keep logout flow resilient even if token file is already locked or missing.
     }
 }
