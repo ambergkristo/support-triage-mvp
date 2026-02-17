@@ -1,7 +1,8 @@
-﻿# secrets
+# secrets
 **/.env
 **/credentials.json
 **/token*.json
+backend/data/
 
 # node
 **/node_modules
@@ -10,7 +11,3 @@
 
 # logs
 **/*.log
-# secrets
-**/.env
-**/credentials.json
-**/token*.json

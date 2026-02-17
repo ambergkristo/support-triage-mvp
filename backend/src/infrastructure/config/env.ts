@@ -12,6 +12,7 @@ const envSchema = z.object({
     FRONTEND_REDIRECT_URL: z.string().url().optional(),
     CORS_ORIGIN: z.string().optional(),
     TOKEN_ENCRYPTION_KEY: z.string().optional(),
+    DB_PATH: z.string().optional(),
 });
 
 const parsed = envSchema.safeParse(process.env);

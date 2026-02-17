@@ -10,6 +10,22 @@ import {
     saveTokens,
     tokenFilePresent,
 } from "../tokenStore";
+import {
+    createRuleConfig,
+    getFeatureFlags,
+    getOverride,
+    listOverrides,
+    listRuleConfigs,
+    listTeamInbox,
+    logActivity,
+    saveMessageMeta,
+    saveTriageResult,
+    setAiTriageEnabled,
+    upsertOverride,
+    type RuleConfig,
+    type TriageOverride,
+} from "../infrastructure/db/opsStateRepository";
+import { getDb } from "../infrastructure/db/database";
 
 const app = express();
 app.use(express.json());
@@ -19,6 +35,8 @@ const AUTH_ERROR = "Not authenticated with Google OAuth";
 const FRONTEND_REDIRECT_URL = env.FRONTEND_REDIRECT_URL;
 const CORS_ORIGIN = env.CORS_ORIGIN;
 const TRIAGE_CACHE_TTL_MS = 30_000;
+
+getDb();
 
 type ApiErrorCode = "BAD_REQUEST" | "UNAUTHORIZED" | "NOT_FOUND" | "INTERNAL_ERROR";
 
@@ -35,50 +53,7 @@ type TriageItem = {
     override?: TriageOverride;
 };
 
-type TriageOverride = {
-    done: boolean;
-    note: string;
-    tags: string[];
-    updatedAt: string;
-};
-
-type RuleConfig = {
-    id: string;
-    name: string;
-    description: string;
-    matchers: string[];
-    priority: "P0" | "P1" | "P2" | "P3";
-    category: string;
-    enabled: boolean;
-};
-
-type FeatureFlags = {
-    aiTriageEnabled: boolean;
-    aiMode: "disabled" | "shadow";
-    safeFallback: "rules";
-};
-
 const triageCache = new Map<string, { expiresAt: number; items: TriageItem[] }>();
-const triageOverrides = new Map<string, TriageOverride>();
-const ruleConfigs = new Map<string, RuleConfig>([
-    [
-        "rule-security-1",
-        {
-            id: "rule-security-1",
-            name: "Security alerts",
-            description: "Escalate suspicious and verification-related messages.",
-            matchers: ["verification code", "security alert", "suspicious"],
-            priority: "P0",
-            category: "security",
-            enabled: true,
-        },
-    ],
-]);
-const featureFlags: FeatureFlags = {
-    aiTriageEnabled: false,
-    aiMode: "disabled",
-    safeFallback: "rules",
-};
 
 const allowedOrigins = CORS_ORIGIN
     ? CORS_ORIGIN.split(",")
@@ -153,13 +128,13 @@ function clearTriageCache() {
 }
 
 function logAudit(event: string, fields: Record<string, unknown> = {}) {
-    console.log(
-        JSON.stringify({
-            ts: new Date().toISOString(),
-            event,
-            ...fields,
-        })
-    );
+    const payload = {
+        ts: new Date().toISOString(),
+        event,
+        ...fields,
+    };
+    console.log(JSON.stringify(payload));
+    logActivity(event, fields);
 }
 
 function hasGoogleOAuthCredentials() {
@@ -229,7 +204,6 @@ app.post("/auth/logout", (req, res) => {
     oAuth2Client.setCredentials({});
     clearTokens();
     clearTriageCache();
-    triageOverrides.clear();
     logAudit("auth_logout");
     res.json({ message: "logged_out" });
 });
@@ -239,11 +213,7 @@ app.get("/triage/overrides", (req, res) => {
         return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
     }
 
-    const items = Array.from(triageOverrides.entries()).map(([id, override]) => ({
-        id,
-        override,
-    }));
-    res.json({ message: "ok", items });
+    res.json({ message: "ok", items: listOverrides() });
 });
 
 app.get("/team/inbox", (req, res) => {
@@ -251,14 +221,7 @@ app.get("/team/inbox", (req, res) => {
         return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
     }
 
-    const items = Array.from(triageOverrides.entries()).map(([id, override]) => ({
-        emailId: id,
-        done: override.done,
-        note: override.note,
-        tags: override.tags,
-        updatedAt: override.updatedAt,
-    }));
-    res.json({ message: "ok", items });
+    res.json({ message: "ok", items: listTeamInbox() });
 });
 
 app.get("/admin/rules", (req, res) => {
@@ -268,7 +231,7 @@ app.get("/admin/rules", (req, res) => {
 
     res.json({
         message: "ok",
-        items: Array.from(ruleConfigs.values()),
+        items: listRuleConfigs(),
     });
 });
 
@@ -306,9 +269,8 @@ app.post("/admin/rules", (req, res) => {
         return sendError(res, 400, "BAD_REQUEST", "Invalid priority");
     }
 
-    const id = `rule-${Date.now()}`;
     const item: RuleConfig = {
-        id,
+        id: `rule-${Date.now()}`,
         name,
         description,
         matchers,
@@ -317,24 +279,22 @@ app.post("/admin/rules", (req, res) => {
         enabled: body.enabled !== false,
     };
 
-    ruleConfigs.set(id, item);
+    createRuleConfig(item);
     res.status(201).json({ message: "ok", item });
 });
 
 app.get("/feature-flags", (req, res) => {
-    res.json({ message: "ok", flags: featureFlags });
+    res.json({ message: "ok", flags: getFeatureFlags() });
 });
 
 app.patch("/feature-flags/ai", (req, res) => {
-    const body = req.body as Partial<FeatureFlags> | undefined;
+    const body = req.body as { aiTriageEnabled?: boolean } | undefined;
     if (!body || typeof body.aiTriageEnabled !== "boolean") {
         return sendError(res, 400, "BAD_REQUEST", "aiTriageEnabled boolean is required");
     }
 
-    featureFlags.aiTriageEnabled = body.aiTriageEnabled;
-    featureFlags.aiMode = featureFlags.aiTriageEnabled ? "shadow" : "disabled";
-    featureFlags.safeFallback = "rules";
-    res.json({ message: "ok", flags: featureFlags });
+    const flags = setAiTriageEnabled(body.aiTriageEnabled);
+    res.json({ message: "ok", flags });
 });
 
 app.put("/triage/overrides/:id", (req, res) => {
@@ -362,14 +322,7 @@ app.put("/triage/overrides/:id", (req, res) => {
             .slice(0, 10)
         : [];
 
-    const override: TriageOverride = {
-        done,
-        note,
-        tags,
-        updatedAt: new Date().toISOString(),
-    };
-
-    triageOverrides.set(id, override);
+    const override = upsertOverride(id, { done, note, tags });
     clearTriageCache();
     res.json({ message: "ok", id, override });
 });
@@ -456,16 +409,23 @@ app.get("/triage", async (req, res) => {
         const page = await listEmailMetasPage(limit, pageToken);
         const emails = page.items;
 
-        const items = emails.map((e) => ({
-            email: e,
-            triage: triageEmailRules({
-                subject: e.subject,
-                from: e.from,
-                snippet: e.snippet,
-                date: e.date,
-            }),
-            ...(triageOverrides.has(e.id) ? { override: triageOverrides.get(e.id) } : {}),
-        }));
+        const items: TriageItem[] = emails.map((email) => {
+            const triage = triageEmailRules({
+                subject: email.subject,
+                from: email.from,
+                snippet: email.snippet,
+                date: email.date,
+            });
+            saveMessageMeta(email);
+            saveTriageResult(email.id, triage);
+
+            const override = getOverride(email.id);
+            if (override) {
+                return { email, triage, override };
+            }
+            return { email, triage };
+        });
+
         triageCache.set(cacheKey, {
             expiresAt: now + TRIAGE_CACHE_TTL_MS,
             items,

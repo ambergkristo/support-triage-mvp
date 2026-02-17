@@ -4,6 +4,30 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
+function sleepMs(ms) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function removeDirWithRetry(dirPath, attempts = 5) {
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        try {
+            fs.rmSync(dirPath, { recursive: true, force: true });
+            return;
+        } catch (error) {
+            const code = error && typeof error === "object" ? error.code : undefined;
+            const isRetriable = code === "EPERM" || code === "EBUSY" || code === "ENOTEMPTY";
+            if (!isRetriable) {
+                throw error;
+            }
+            if (attempt === attempts) {
+                console.warn(`WARN: temp cleanup skipped for ${dirPath} (${code})`);
+                return;
+            }
+            sleepMs(50 * attempt);
+        }
+    }
+}
+
 function fail(message) {
     throw new Error(message);
 }
@@ -306,7 +330,7 @@ results.push(
                 process.env.TOKEN_ENCRYPTION_KEY = previousEncryptionKey;
             }
             process.chdir(previousCwd);
-            fs.rmSync(tmpRoot, { recursive: true, force: true });
+            removeDirWithRetry(tmpRoot);
         }
     })
 );
@@ -345,7 +369,88 @@ results.push(
                 process.env.TOKEN_ENCRYPTION_KEY = previousEncryptionKey;
             }
             process.chdir(previousCwd);
-            fs.rmSync(tmpRoot, { recursive: true, force: true });
+            removeDirWithRetry(tmpRoot);
+        }
+    })
+);
+
+results.push(
+    test("sqlite state: feature flags, rules, and overrides persist", () => {
+        const previousCwd = process.cwd();
+        const previousDbPath = process.env.DB_PATH;
+        const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "opsinbox-db-state-"));
+        let dbModule = null;
+
+        try {
+            process.chdir(tmpRoot);
+            process.env.DB_PATH = path.join(tmpRoot, "state.db");
+
+            const envPath = require.resolve("../src/infrastructure/config/env.ts");
+            const dbPath = require.resolve("../src/infrastructure/db/database.ts");
+            const repoPath = require.resolve("../src/infrastructure/db/opsStateRepository.ts");
+            delete require.cache[envPath];
+            delete require.cache[dbPath];
+            delete require.cache[repoPath];
+
+            const repo = require("../src/infrastructure/db/opsStateRepository.ts");
+            dbModule = require("../src/infrastructure/db/database.ts");
+
+            const defaults = repo.getFeatureFlags();
+            assertEqual(defaults.aiTriageEnabled, false, "Default aiTriageEnabled should be false");
+
+            const updatedFlags = repo.setAiTriageEnabled(true);
+            assertEqual(updatedFlags.aiMode, "shadow", "Enabled AI flag should set shadow mode");
+            const loadedFlags = repo.getFeatureFlags();
+            assertEqual(loadedFlags.aiTriageEnabled, true, "Updated feature flag should persist");
+
+            const createdRule = repo.createRuleConfig({
+                id: "rule-test-1",
+                name: "CI failures",
+                description: "Escalate CI failures",
+                matchers: ["ci failed", "build failed"],
+                priority: "P1",
+                category: "operations",
+                enabled: true,
+            });
+            assertEqual(createdRule.id, "rule-test-1", "Rule should be created");
+            const rules = repo.listRuleConfigs();
+            assertTrue(rules.some((rule) => rule.id === "rule-test-1"), "Created rule should be listed");
+
+            const override = repo.upsertOverride("msg-123", {
+                done: true,
+                note: "Handled by on-call",
+                tags: ["oncall", "incident"],
+            });
+            assertEqual(override.done, true, "Override should store done=true");
+            const loadedOverride = repo.getOverride("msg-123");
+            assertEqual(loadedOverride?.note, "Handled by on-call", "Override note should persist");
+
+            repo.saveMessageMeta({
+                id: "msg-123",
+                threadId: "thread-123",
+                from: "alerts@github.com",
+                subject: "CI failed",
+                snippet: "Build failed on main",
+                date: new Date().toUTCString(),
+            });
+            repo.saveTriageResult("msg-123", {
+                priority: "P1",
+                category: "operations",
+                summary: "Operational alert likely requiring quick action.",
+                action: "Review logs or system status and resolve failures.",
+                confidence: 0.88,
+            });
+        } finally {
+            if (dbModule && typeof dbModule.closeDb === "function") {
+                dbModule.closeDb();
+            }
+            if (previousDbPath === undefined) {
+                delete process.env.DB_PATH;
+            } else {
+                process.env.DB_PATH = previousDbPath;
+            }
+            process.chdir(previousCwd);
+            removeDirWithRetry(tmpRoot);
         }
     })
 );
