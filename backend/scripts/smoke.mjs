@@ -28,6 +28,26 @@ function hasAuthStatusShape(payload) {
     );
 }
 
+function parseJsonOrNull(text) {
+    try {
+        return JSON.parse(text);
+    } catch {
+        return null;
+    }
+}
+
+function hasUnifiedErrorShape(payload) {
+    return (
+        typeof payload === "object" &&
+        payload !== null &&
+        payload.message === "error" &&
+        typeof payload.error === "object" &&
+        payload.error !== null &&
+        typeof payload.error.code === "string" &&
+        typeof payload.error.message === "string"
+    );
+}
+
 try {
     console.log(`Smoke base URL: ${baseUrl}`);
     console.log(`Smoke mode: ${unauthenticatedMode ? "unauthenticated" : "auto"}`);
@@ -64,10 +84,31 @@ try {
         fail("/triage expected 401 in unauthenticated mode");
     }
 
+    if (triage.status === 401) {
+        const triageError = parseJsonOrNull(triage.body);
+        if (!hasUnifiedErrorShape(triageError)) {
+            fail("/triage 401 response missing unified error shape");
+        }
+        pass("/triage 401 response has unified error shape");
+    }
+
     if (triage.body.toLowerCase().includes(quotaText.toLowerCase())) {
         fail("triage response contains OpenAI quota text");
     }
     pass(`/triage returned ${triage.status} and no quota text`);
+
+    if (unauthenticatedMode) {
+        const gmailList = await request("/gmail/messages?limit=1");
+        if (gmailList.status !== 401) {
+            fail(`/gmail/messages expected 401 in unauthenticated mode, got ${gmailList.status}`);
+        }
+
+        const gmailError = parseJsonOrNull(gmailList.body);
+        if (!hasUnifiedErrorShape(gmailError)) {
+            fail("/gmail/messages 401 response missing unified error shape");
+        }
+        pass("/gmail/messages unauthenticated guard is enforced");
+    }
 
     console.log("SMOKE PASS");
 } catch (err) {
