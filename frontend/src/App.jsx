@@ -2,8 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:3000";
 
-async function fetchJson(path) {
-  const response = await fetch(`${API_BASE_URL}${path}`);
+async function fetchJson(path, options) {
+  const response = await fetch(`${API_BASE_URL}${path}`, options);
   const raw = await response.text();
   let data = null;
 
@@ -21,6 +21,15 @@ async function fetchJson(path) {
   };
 }
 
+function normalizeOverride(item) {
+  const current = item?.override || {};
+  return {
+    done: Boolean(current.done),
+    note: typeof current.note === "string" ? current.note : "",
+    tags: Array.isArray(current.tags) ? current.tags.join(", ") : "",
+  };
+}
+
 export default function App() {
   const [status, setStatus] = useState(null);
   const [items, setItems] = useState([]);
@@ -28,8 +37,12 @@ export default function App() {
   const [detailBody, setDetailBody] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
   const [priorityFilter, setPriorityFilter] = useState("all");
   const [categoryFilter, setCategoryFilter] = useState("all");
+  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [refreshSeconds, setRefreshSeconds] = useState(60);
+  const [overrideForm, setOverrideForm] = useState({ done: false, note: "", tags: "" });
 
   async function loadStatus() {
     const result = await fetchJson("/auth/status");
@@ -42,7 +55,6 @@ export default function App() {
 
   async function loadTriage(limit = 20) {
     setLoading(true);
-    setError("");
 
     try {
       const result = await fetchJson(`/triage?limit=${limit}`);
@@ -57,9 +69,13 @@ export default function App() {
         throw new Error("Failed to load triage list.");
       }
 
+      setError("");
       setItems(result.data.items);
       const first = result.data.items[0] ?? null;
-      setSelected(first);
+      setSelected((previous) => {
+        const retained = result.data.items.find((it) => it.email.id === previous?.email?.id);
+        return retained || first;
+      });
       setDetailBody("");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unexpected error.");
@@ -80,6 +96,7 @@ export default function App() {
   }
 
   async function handleRefresh() {
+    setInfo("");
     try {
       const nextStatus = await loadStatus();
       if (nextStatus.authenticated) {
@@ -94,9 +111,55 @@ export default function App() {
     }
   }
 
+  async function saveOverride() {
+    if (!selected?.email?.id) return;
+
+    const tags = overrideForm.tags
+      .split(",")
+      .map((tag) => tag.trim())
+      .filter(Boolean);
+
+    const result = await fetchJson(`/triage/overrides/${selected.email.id}`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        done: overrideForm.done,
+        note: overrideForm.note,
+        tags,
+      }),
+    });
+
+    if (!result.ok) {
+      setError("Failed to save override.");
+      return;
+    }
+
+    setInfo("Override saved.");
+    await loadTriage(20);
+  }
+
   useEffect(() => {
     handleRefresh();
   }, []);
+
+  useEffect(() => {
+    if (!autoRefresh || !status?.authenticated) {
+      return undefined;
+    }
+
+    const intervalMs = Math.max(15, Number(refreshSeconds) || 60) * 1000;
+    const id = setInterval(() => {
+      loadTriage(20);
+    }, intervalMs);
+
+    return () => clearInterval(id);
+  }, [autoRefresh, refreshSeconds, status?.authenticated]);
+
+  useEffect(() => {
+    setOverrideForm(normalizeOverride(selected));
+  }, [selected?.email?.id]);
 
   const categories = useMemo(() => {
     const unique = new Set(items.map((it) => it.triage?.category).filter(Boolean));
@@ -115,7 +178,7 @@ export default function App() {
     <div className="page">
       <header className="hero">
         <h1>Support Triage Workbench</h1>
-        <p>Connect Google, inspect inbox triage, and open message details.</p>
+        <p>Connect Google, inspect inbox triage, and process messages with notes and tags.</p>
         <div className="actions">
           <a className="button" href={`${API_BASE_URL}/auth/google`}>
             Connect Google
@@ -133,7 +196,7 @@ export default function App() {
         ) : (
           <p>
             Connection: <strong>{status.authenticated ? "Connected" : "Disconnected"}</strong> | Refresh token: {" "}
-            <strong>{status.hasRefreshToken ? "Yes" : "No"}</strong>
+            <strong>{status.hasRefreshToken ? "Yes" : "No"}</strong> | Token file: <strong>{status.tokenFilePresent ? "Present" : "Missing"}</strong>
           </p>
         )}
       </section>
@@ -162,11 +225,30 @@ export default function App() {
                 ))}
               </select>
             </label>
+            <label>
+              Auto refresh
+              <select value={autoRefresh ? "on" : "off"} onChange={(e) => setAutoRefresh(e.target.value === "on")}>
+                <option value="on">On</option>
+                <option value="off">Off</option>
+              </select>
+            </label>
+            <label>
+              Refresh seconds
+              <input
+                type="number"
+                min={15}
+                value={refreshSeconds}
+                onChange={(e) => setRefreshSeconds(Number(e.target.value) || 60)}
+              />
+            </label>
           </div>
         </div>
 
-        {loading ? <p>Loading triage...</p> : null}
+        {loading ? <p className="info">Loading triage...</p> : null}
         {error ? <p className="error">{error}</p> : null}
+        {info ? <p className="success">{info}</p> : null}
+
+        {!loading && !error && items.length === 0 ? <p className="info">No items yet. Connect Google and refresh.</p> : null}
 
         <div className="grid">
           <table>
@@ -177,6 +259,7 @@ export default function App() {
                 <th>Subject</th>
                 <th>Date</th>
                 <th>Category</th>
+                <th>Done</th>
               </tr>
             </thead>
             <tbody>
@@ -194,11 +277,12 @@ export default function App() {
                   <td>{item.email.subject}</td>
                   <td>{item.email.date}</td>
                   <td>{item.triage.category}</td>
+                  <td>{item.override?.done ? "Yes" : "No"}</td>
                 </tr>
               ))}
               {!loading && filteredItems.length === 0 ? (
                 <tr>
-                  <td colSpan={5}>No triage items for selected filters.</td>
+                  <td colSpan={6}>No triage items for selected filters.</td>
                 </tr>
               ) : null}
             </tbody>
@@ -215,6 +299,38 @@ export default function App() {
                 <p><strong>Summary:</strong> {selected.triage.summary}</p>
                 <p><strong>Action:</strong> {selected.triage.action}</p>
                 <p><strong>Confidence:</strong> {selected.triage.confidence}</p>
+
+                <div className="override-box">
+                  <h4>Manual Override</h4>
+                  <label className="checkbox-row">
+                    <input
+                      type="checkbox"
+                      checked={overrideForm.done}
+                      onChange={(e) => setOverrideForm((prev) => ({ ...prev, done: e.target.checked }))}
+                    />
+                    Mark done
+                  </label>
+                  <label>
+                    Note
+                    <textarea
+                      value={overrideForm.note}
+                      onChange={(e) => setOverrideForm((prev) => ({ ...prev, note: e.target.value }))}
+                      rows={3}
+                    />
+                  </label>
+                  <label>
+                    Tags (comma separated)
+                    <input
+                      type="text"
+                      value={overrideForm.tags}
+                      onChange={(e) => setOverrideForm((prev) => ({ ...prev, tags: e.target.value }))}
+                    />
+                  </label>
+                  <button className="button button-secondary" type="button" onClick={saveOverride}>
+                    Save override
+                  </button>
+                </div>
+
                 <p><strong>Body:</strong></p>
                 <pre>{detailBody || selected.email.snippet || "(No body loaded yet)"}</pre>
               </>
