@@ -14,12 +14,12 @@ import {
 dotenv.config();
 
 const app = express();
-app.use(cors());
 app.use(express.json());
 
 const PORT = Number(process.env.PORT ?? 3000);
 const AUTH_ERROR = "Not authenticated with Google OAuth";
 const FRONTEND_REDIRECT_URL = process.env.FRONTEND_REDIRECT_URL;
+const CORS_ORIGIN = process.env.CORS_ORIGIN;
 const TRIAGE_CACHE_TTL_MS = 30_000;
 
 type ApiErrorCode = "BAD_REQUEST" | "UNAUTHORIZED" | "NOT_FOUND" | "INTERNAL_ERROR";
@@ -34,9 +34,83 @@ type TriageItem = {
         date: string;
     };
     triage: ReturnType<typeof triageEmailRules>;
+    override?: TriageOverride;
+};
+
+type TriageOverride = {
+    done: boolean;
+    note: string;
+    tags: string[];
+    updatedAt: string;
+};
+
+type RuleConfig = {
+    id: string;
+    name: string;
+    description: string;
+    matchers: string[];
+    priority: "P0" | "P1" | "P2" | "P3";
+    category: string;
+    enabled: boolean;
+};
+
+type FeatureFlags = {
+    aiTriageEnabled: boolean;
+    aiMode: "disabled" | "shadow";
+    safeFallback: "rules";
 };
 
 const triageCache = new Map<string, { expiresAt: number; items: TriageItem[] }>();
+const triageOverrides = new Map<string, TriageOverride>();
+const ruleConfigs = new Map<string, RuleConfig>([
+    [
+        "rule-security-1",
+        {
+            id: "rule-security-1",
+            name: "Security alerts",
+            description: "Escalate suspicious and verification-related messages.",
+            matchers: ["verification code", "security alert", "suspicious"],
+            priority: "P0",
+            category: "security",
+            enabled: true,
+        },
+    ],
+]);
+const featureFlags: FeatureFlags = {
+    aiTriageEnabled: false,
+    aiMode: "disabled",
+    safeFallback: "rules",
+};
+
+const allowedOrigins = CORS_ORIGIN
+    ? CORS_ORIGIN.split(",")
+        .map((origin) => origin.trim())
+        .filter((origin) => origin.length > 0)
+    : [];
+
+app.use(
+    cors({
+        origin: (origin, callback) => {
+            if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+                return callback(null, true);
+            }
+            return callback(new Error("CORS origin denied"));
+        },
+    })
+);
+
+app.use((req, res, next) => {
+    const startedAt = Date.now();
+    res.on("finish", () => {
+        logAudit("http_request", {
+            method: req.method,
+            path: req.originalUrl,
+            status: res.statusCode,
+            durationMs: Date.now() - startedAt,
+        });
+    });
+    next();
+});
 
 function sendError(
     res: express.Response,
@@ -78,6 +152,16 @@ function triageCacheKey(limit: number, pageToken?: string): string {
 
 function clearTriageCache() {
     triageCache.clear();
+}
+
+function logAudit(event: string, fields: Record<string, unknown> = {}) {
+    console.log(
+        JSON.stringify({
+            ts: new Date().toISOString(),
+            event,
+            ...fields,
+        })
+    );
 }
 
 function hasGoogleOAuthCredentials() {
@@ -122,11 +206,14 @@ app.get("/oauth2callback", async (req, res) => {
         const emails = await listEmailMetas(10);
 
         if (FRONTEND_REDIRECT_URL) {
+            logAudit("auth_oauth_success", { redirectedToFrontend: true });
             return res.redirect(`${FRONTEND_REDIRECT_URL}?oauth=success`);
         }
 
+        logAudit("auth_oauth_success", { redirectedToFrontend: false });
         res.json({ message: "OAuth successful", emails });
     } catch (err: any) {
+        logAudit("auth_oauth_failed", { reason: err?.message ?? "unknown" });
         sendError(res, 500, "INTERNAL_ERROR", err?.message ?? "OAuth failed");
     }
 });
@@ -144,7 +231,149 @@ app.post("/auth/logout", (req, res) => {
     oAuth2Client.setCredentials({});
     clearTokens();
     clearTriageCache();
+    triageOverrides.clear();
+    logAudit("auth_logout");
     res.json({ message: "logged_out" });
+});
+
+app.get("/triage/overrides", (req, res) => {
+    if (!hasGoogleOAuthCredentials()) {
+        return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
+    }
+
+    const items = Array.from(triageOverrides.entries()).map(([id, override]) => ({
+        id,
+        override,
+    }));
+    res.json({ message: "ok", items });
+});
+
+app.get("/team/inbox", (req, res) => {
+    if (!hasGoogleOAuthCredentials()) {
+        return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
+    }
+
+    const items = Array.from(triageOverrides.entries()).map(([id, override]) => ({
+        emailId: id,
+        done: override.done,
+        note: override.note,
+        tags: override.tags,
+        updatedAt: override.updatedAt,
+    }));
+    res.json({ message: "ok", items });
+});
+
+app.get("/admin/rules", (req, res) => {
+    if (!hasGoogleOAuthCredentials()) {
+        return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
+    }
+
+    res.json({
+        message: "ok",
+        items: Array.from(ruleConfigs.values()),
+    });
+});
+
+app.post("/admin/rules", (req, res) => {
+    if (!hasGoogleOAuthCredentials()) {
+        return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
+    }
+
+    const body = req.body as Partial<RuleConfig> | undefined;
+    if (!body || typeof body !== "object") {
+        return sendError(res, 400, "BAD_REQUEST", "Invalid rule payload");
+    }
+
+    const name = typeof body.name === "string" && body.name.trim() ? body.name.trim() : "";
+    const description =
+        typeof body.description === "string" && body.description.trim() ? body.description.trim() : "";
+    const priority = body.priority;
+    const category = typeof body.category === "string" ? body.category.trim() : "";
+    const matchers = Array.isArray(body.matchers)
+        ? body.matchers
+            .filter((matcher): matcher is string => typeof matcher === "string")
+            .map((matcher) => matcher.trim())
+            .filter(Boolean)
+        : [];
+    if (!name || !description || !category || !priority || matchers.length === 0) {
+        return sendError(
+            res,
+            400,
+            "BAD_REQUEST",
+            "Rule requires name, description, priority, category, and at least one matcher"
+        );
+    }
+
+    if (!["P0", "P1", "P2", "P3"].includes(priority)) {
+        return sendError(res, 400, "BAD_REQUEST", "Invalid priority");
+    }
+
+    const id = `rule-${Date.now()}`;
+    const item: RuleConfig = {
+        id,
+        name,
+        description,
+        matchers,
+        priority,
+        category,
+        enabled: body.enabled !== false,
+    };
+
+    ruleConfigs.set(id, item);
+    res.status(201).json({ message: "ok", item });
+});
+
+app.get("/feature-flags", (req, res) => {
+    res.json({ message: "ok", flags: featureFlags });
+});
+
+app.patch("/feature-flags/ai", (req, res) => {
+    const body = req.body as Partial<FeatureFlags> | undefined;
+    if (!body || typeof body.aiTriageEnabled !== "boolean") {
+        return sendError(res, 400, "BAD_REQUEST", "aiTriageEnabled boolean is required");
+    }
+
+    featureFlags.aiTriageEnabled = body.aiTriageEnabled;
+    featureFlags.aiMode = featureFlags.aiTriageEnabled ? "shadow" : "disabled";
+    featureFlags.safeFallback = "rules";
+    res.json({ message: "ok", flags: featureFlags });
+});
+
+app.put("/triage/overrides/:id", (req, res) => {
+    if (!hasGoogleOAuthCredentials()) {
+        return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
+    }
+
+    const id = req.params.id;
+    if (!id) {
+        return sendError(res, 400, "BAD_REQUEST", "Missing email id");
+    }
+
+    const body = req.body as Partial<TriageOverride> | undefined;
+    if (!body || typeof body !== "object") {
+        return sendError(res, 400, "BAD_REQUEST", "Invalid override payload");
+    }
+
+    const done = typeof body.done === "boolean" ? body.done : false;
+    const note = typeof body.note === "string" ? body.note.slice(0, 1000) : "";
+    const tags = Array.isArray(body.tags)
+        ? body.tags
+            .filter((tag): tag is string => typeof tag === "string")
+            .map((tag) => tag.trim())
+            .filter((tag) => tag.length > 0)
+            .slice(0, 10)
+        : [];
+
+    const override: TriageOverride = {
+        done,
+        note,
+        tags,
+        updatedAt: new Date().toISOString(),
+    };
+
+    triageOverrides.set(id, override);
+    clearTriageCache();
+    res.json({ message: "ok", id, override });
 });
 
 app.get("/gmail/messages", async (req, res) => {
@@ -237,6 +466,7 @@ app.get("/triage", async (req, res) => {
                 snippet: e.snippet,
                 date: e.date,
             }),
+            ...(triageOverrides.has(e.id) ? { override: triageOverrides.get(e.id) } : {}),
         }));
         triageCache.set(cacheKey, {
             expiresAt: now + TRIAGE_CACHE_TTL_MS,
@@ -250,6 +480,13 @@ app.get("/triage", async (req, res) => {
         }
         sendError(res, 500, "INTERNAL_ERROR", err?.message ?? "Triage failed");
     }
+});
+
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (err instanceof SyntaxError && "body" in err) {
+        return sendError(res, 400, "BAD_REQUEST", "Invalid JSON body");
+    }
+    return next(err);
 });
 
 app.listen(PORT, () => {

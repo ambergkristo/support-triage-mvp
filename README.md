@@ -76,3 +76,9 @@ Never commit:
 - `backend/credentials.json`
 - `backend/data/token.json`
 - `token*.json`
+
+## Deployment
+See `DEPLOYMENT.md` for Docker and Render deployment steps (HTTPS + CORS config included).
+
+## Security
+See `SECURITY.md` for token encryption-at-rest, audit logging, and secret-check commands.
