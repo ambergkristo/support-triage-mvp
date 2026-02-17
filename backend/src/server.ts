@@ -1,41 +1,27 @@
+import crypto from "crypto";
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { getAuthUrl, oAuth2Client, listEmailMetas, listEmailMetasPage, getEmailDetail } from "./gmail";
-import { triageEmailRules } from "./triageRules";
-import { mergeTokensForPersistence } from "./authTokenPersistence";
 import {
-    clearTokens,
-    loadTokens,
-    saveTokens,
-    tokenFilePresent,
-} from "./tokenStore";
+    exchangeCodeForTokens,
+    getAuthUrl,
+    getEmailDetail,
+    getGoogleUserEmail,
+    listEmailMetasPage,
+} from "./gmail";
+import { triageEmailRules } from "./triageRules";
+import { getDatabase } from "./infrastructure/sqlite";
+import { UserRepository } from "./infrastructure/repositories/userRepository";
+import { WorkspaceRepository } from "./infrastructure/repositories/workspaceRepository";
+import { InboxAccountRepository } from "./infrastructure/repositories/inboxAccountRepository";
+import { OAuthTokenRepository } from "./infrastructure/repositories/oauthTokenRepository";
+import { TriageOverrideRepository } from "./infrastructure/repositories/triageOverrideRepository";
+import { RuleConfigRepository, type RuleConfig } from "./infrastructure/repositories/ruleConfigRepository";
+import { FeatureFlagRepository } from "./infrastructure/repositories/featureFlagRepository";
 
 dotenv.config();
 
-const app = express();
-app.use(express.json());
-
-const PORT = Number(process.env.PORT ?? 3000);
-const AUTH_ERROR = "Not authenticated with Google OAuth";
-const FRONTEND_REDIRECT_URL = process.env.FRONTEND_REDIRECT_URL;
-const CORS_ORIGIN = process.env.CORS_ORIGIN;
-const TRIAGE_CACHE_TTL_MS = 30_000;
-
 type ApiErrorCode = "BAD_REQUEST" | "UNAUTHORIZED" | "NOT_FOUND" | "INTERNAL_ERROR";
-
-type TriageItem = {
-    email: {
-        id: string;
-        threadId: string;
-        snippet: string;
-        subject: string;
-        from: string;
-        date: string;
-    };
-    triage: ReturnType<typeof triageEmailRules>;
-    override?: TriageOverride;
-};
 
 type TriageOverride = {
     done: boolean;
@@ -44,73 +30,47 @@ type TriageOverride = {
     updatedAt: string;
 };
 
-type RuleConfig = {
-    id: string;
-    name: string;
-    description: string;
-    matchers: string[];
-    priority: "P0" | "P1" | "P2" | "P3";
-    category: string;
-    enabled: boolean;
-};
+const PORT = Number(process.env.PORT ?? 3000);
+const FRONTEND_REDIRECT_URL = process.env.FRONTEND_REDIRECT_URL;
+const CORS_ORIGIN = process.env.CORS_ORIGIN;
 
-type FeatureFlags = {
-    aiTriageEnabled: boolean;
-    aiMode: "disabled" | "shadow";
-    safeFallback: "rules";
-};
+const db = getDatabase();
+const userRepository = new UserRepository(db);
+const workspaceRepository = new WorkspaceRepository(db);
+const inboxAccountRepository = new InboxAccountRepository(db);
+const oauthTokenRepository = new OAuthTokenRepository(db);
+const triageOverrideRepository = new TriageOverrideRepository(db);
+const ruleConfigRepository = new RuleConfigRepository(db);
+const featureFlagRepository = new FeatureFlagRepository(db);
 
-const triageCache = new Map<string, { expiresAt: number; items: TriageItem[] }>();
-const triageOverrides = new Map<string, TriageOverride>();
-const ruleConfigs = new Map<string, RuleConfig>([
-    [
-        "rule-security-1",
-        {
-            id: "rule-security-1",
-            name: "Security alerts",
-            description: "Escalate suspicious and verification-related messages.",
-            matchers: ["verification code", "security alert", "suspicious"],
-            priority: "P0",
-            category: "security",
-            enabled: true,
-        },
-    ],
-]);
-const featureFlags: FeatureFlags = {
-    aiTriageEnabled: false,
-    aiMode: "disabled",
-    safeFallback: "rules",
-};
+function ensureDefaultRules(): void {
+    const existing = ruleConfigRepository.listAll();
+    if (existing.length > 0) {
+        return;
+    }
 
-const allowedOrigins = CORS_ORIGIN
-    ? CORS_ORIGIN.split(",")
-        .map((origin) => origin.trim())
-        .filter((origin) => origin.length > 0)
-    : [];
-
-app.use(
-    cors({
-        origin: (origin, callback) => {
-            if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
-                return callback(null, true);
-            }
-            return callback(new Error("CORS origin denied"));
-        },
-    })
-);
-
-app.use((req, res, next) => {
-    const startedAt = Date.now();
-    res.on("finish", () => {
-        logAudit("http_request", {
-            method: req.method,
-            path: req.originalUrl,
-            status: res.statusCode,
-            durationMs: Date.now() - startedAt,
-        });
+    ruleConfigRepository.create({
+        id: "rule-security-1",
+        name: "Security alerts",
+        description: "Escalate suspicious and verification-related messages.",
+        matchers: ["verification code", "security alert", "suspicious"],
+        priority: "P0",
+        category: "security",
+        enabled: true,
     });
-    next();
-});
+}
+
+ensureDefaultRules();
+
+function logAudit(event: string, fields: Record<string, unknown> = {}) {
+    console.log(
+        JSON.stringify({
+            ts: new Date().toISOString(),
+            event,
+            ...fields,
+        })
+    );
+}
 
 function sendError(
     res: express.Response,
@@ -146,349 +106,435 @@ function parseLimit(
     return { value: parsed };
 }
 
-function triageCacheKey(limit: number, pageToken?: string): string {
-    return `${limit}:${pageToken ?? ""}`;
+function requireActiveGoogleContext(res: express.Response) {
+    const context = oauthTokenRepository.findLatestLinkedContext();
+    if (!context) {
+        sendError(res, 401, "UNAUTHORIZED", "Not authenticated with Google OAuth");
+        return null;
+    }
+
+    const tokens = oauthTokenRepository.findForInboxAccount(context.inboxAccountId);
+    if (!tokens) {
+        sendError(res, 401, "UNAUTHORIZED", "Not authenticated with Google OAuth");
+        return null;
+    }
+
+    return { context, tokens };
 }
 
-function clearTriageCache() {
-    triageCache.clear();
-}
+export function createApp() {
+    const app = express();
+    app.use(express.json());
 
-function logAudit(event: string, fields: Record<string, unknown> = {}) {
-    console.log(
-        JSON.stringify({
-            ts: new Date().toISOString(),
-            event,
-            ...fields,
+    const allowedOrigins = CORS_ORIGIN
+        ? CORS_ORIGIN.split(",")
+              .map((origin) => origin.trim())
+              .filter((origin) => origin.length > 0)
+        : [];
+
+    app.use(
+        cors({
+            origin: (origin, callback) => {
+                if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+                    return callback(null, true);
+                }
+                return callback(new Error("CORS origin denied"));
+            },
         })
     );
-}
 
-function hasGoogleOAuthCredentials() {
-    const creds = oAuth2Client.credentials;
-    return Boolean(creds?.access_token || creds?.refresh_token);
-}
-
-const persistedTokens = loadTokens();
-if (persistedTokens) {
-    oAuth2Client.setCredentials(persistedTokens);
-}
-
-app.get("/", (req, res) => {
-    res.json({ status: "API running" });
-});
-
-app.get("/health", (req, res) => {
-    res.json({ status: "ok" });
-});
-
-app.get("/auth/google", (req, res) => {
-    res.redirect(getAuthUrl());
-});
-
-app.get("/oauth2callback", async (req, res) => {
-    try {
-        const code = req.query.code as string | undefined;
-        if (!code) {
-            return sendError(res, 400, "BAD_REQUEST", "Missing code");
-        }
-
-        const { tokens } = await oAuth2Client.getToken(code);
-        const mergedTokens = mergeTokensForPersistence({
-            nextTokens: tokens,
-            currentTokens: oAuth2Client.credentials,
-            persistedTokens: loadTokens(),
+    app.use((req, res, next) => {
+        const startedAt = Date.now();
+        res.on("finish", () => {
+            logAudit("http_request", {
+                method: req.method,
+                path: req.originalUrl,
+                status: res.statusCode,
+                durationMs: Date.now() - startedAt,
+            });
         });
-        oAuth2Client.setCredentials(mergedTokens);
-        saveTokens(mergedTokens);
-        clearTriageCache();
-
-        const emails = await listEmailMetas(10);
-
-        if (FRONTEND_REDIRECT_URL) {
-            logAudit("auth_oauth_success", { redirectedToFrontend: true });
-            return res.redirect(`${FRONTEND_REDIRECT_URL}?oauth=success`);
-        }
-
-        logAudit("auth_oauth_success", { redirectedToFrontend: false });
-        res.json({ message: "OAuth successful", emails });
-    } catch (err: any) {
-        logAudit("auth_oauth_failed", { reason: err?.message ?? "unknown" });
-        sendError(res, 500, "INTERNAL_ERROR", err?.message ?? "OAuth failed");
-    }
-});
-
-app.get("/auth/status", (req, res) => {
-    const creds = oAuth2Client.credentials;
-    res.json({
-        authenticated: Boolean(creds?.access_token || creds?.refresh_token),
-        hasRefreshToken: Boolean(creds?.refresh_token),
-        tokenFilePresent: tokenFilePresent(),
+        next();
     });
-});
 
-app.post("/auth/logout", (req, res) => {
-    oAuth2Client.setCredentials({});
-    clearTokens();
-    clearTriageCache();
-    triageOverrides.clear();
-    logAudit("auth_logout");
-    res.json({ message: "logged_out" });
-});
-
-app.get("/triage/overrides", (req, res) => {
-    if (!hasGoogleOAuthCredentials()) {
-        return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
-    }
-
-    const items = Array.from(triageOverrides.entries()).map(([id, override]) => ({
-        id,
-        override,
-    }));
-    res.json({ message: "ok", items });
-});
-
-app.get("/team/inbox", (req, res) => {
-    if (!hasGoogleOAuthCredentials()) {
-        return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
-    }
-
-    const items = Array.from(triageOverrides.entries()).map(([id, override]) => ({
-        emailId: id,
-        done: override.done,
-        note: override.note,
-        tags: override.tags,
-        updatedAt: override.updatedAt,
-    }));
-    res.json({ message: "ok", items });
-});
-
-app.get("/admin/rules", (req, res) => {
-    if (!hasGoogleOAuthCredentials()) {
-        return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
-    }
-
-    res.json({
-        message: "ok",
-        items: Array.from(ruleConfigs.values()),
+    app.get("/", (req, res) => {
+        res.json({ status: "API running" });
     });
-});
 
-app.post("/admin/rules", (req, res) => {
-    if (!hasGoogleOAuthCredentials()) {
-        return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
-    }
+    app.get("/health", (req, res) => {
+        res.json({ status: "ok" });
+    });
 
-    const body = req.body as Partial<RuleConfig> | undefined;
-    if (!body || typeof body !== "object") {
-        return sendError(res, 400, "BAD_REQUEST", "Invalid rule payload");
-    }
+    app.get("/auth/google", (req, res) => {
+        res.redirect(getAuthUrl());
+    });
 
-    const name = typeof body.name === "string" && body.name.trim() ? body.name.trim() : "";
-    const description =
-        typeof body.description === "string" && body.description.trim() ? body.description.trim() : "";
-    const priority = body.priority;
-    const category = typeof body.category === "string" ? body.category.trim() : "";
-    const matchers = Array.isArray(body.matchers)
-        ? body.matchers
-            .filter((matcher): matcher is string => typeof matcher === "string")
-            .map((matcher) => matcher.trim())
-            .filter(Boolean)
-        : [];
-    if (!name || !description || !category || !priority || matchers.length === 0) {
-        return sendError(
-            res,
-            400,
-            "BAD_REQUEST",
-            "Rule requires name, description, priority, category, and at least one matcher"
-        );
-    }
+    app.get("/oauth2callback", async (req, res) => {
+        try {
+            const code = req.query.code as string | undefined;
+            if (!code) {
+                return sendError(res, 400, "BAD_REQUEST", "Missing code");
+            }
 
-    if (!["P0", "P1", "P2", "P3"].includes(priority)) {
-        return sendError(res, 400, "BAD_REQUEST", "Invalid priority");
-    }
+            const tokens = await exchangeCodeForTokens(code);
+            const email = await getGoogleUserEmail(tokens);
+            if (!email) {
+                return sendError(res, 500, "INTERNAL_ERROR", "Google account email not available");
+            }
 
-    const id = `rule-${Date.now()}`;
-    const item: RuleConfig = {
-        id,
-        name,
-        description,
-        matchers,
-        priority,
-        category,
-        enabled: body.enabled !== false,
-    };
+            const user = userRepository.upsertGoogleUserByEmail(email);
+            const workspace = workspaceRepository.ensurePersonalWorkspace(user.id);
+            workspaceRepository.ensureOwnerMembership(workspace.id, user.id);
+            const inboxAccount = inboxAccountRepository.upsertGoogleAccount(workspace.id, user.email, user.email);
+            oauthTokenRepository.saveForInboxAccount(inboxAccount.id, tokens);
 
-    ruleConfigs.set(id, item);
-    res.status(201).json({ message: "ok", item });
-});
+            if (FRONTEND_REDIRECT_URL) {
+                logAudit("auth_oauth_success", {
+                    redirectedToFrontend: true,
+                    userId: user.id,
+                    workspaceId: workspace.id,
+                    inboxAccountId: inboxAccount.id,
+                });
+                return res.redirect(`${FRONTEND_REDIRECT_URL}?oauth=success`);
+            }
 
-app.get("/feature-flags", (req, res) => {
-    res.json({ message: "ok", flags: featureFlags });
-});
-
-app.patch("/feature-flags/ai", (req, res) => {
-    const body = req.body as Partial<FeatureFlags> | undefined;
-    if (!body || typeof body.aiTriageEnabled !== "boolean") {
-        return sendError(res, 400, "BAD_REQUEST", "aiTriageEnabled boolean is required");
-    }
-
-    featureFlags.aiTriageEnabled = body.aiTriageEnabled;
-    featureFlags.aiMode = featureFlags.aiTriageEnabled ? "shadow" : "disabled";
-    featureFlags.safeFallback = "rules";
-    res.json({ message: "ok", flags: featureFlags });
-});
-
-app.put("/triage/overrides/:id", (req, res) => {
-    if (!hasGoogleOAuthCredentials()) {
-        return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
-    }
-
-    const id = req.params.id;
-    if (!id) {
-        return sendError(res, 400, "BAD_REQUEST", "Missing email id");
-    }
-
-    const body = req.body as Partial<TriageOverride> | undefined;
-    if (!body || typeof body !== "object") {
-        return sendError(res, 400, "BAD_REQUEST", "Invalid override payload");
-    }
-
-    const done = typeof body.done === "boolean" ? body.done : false;
-    const note = typeof body.note === "string" ? body.note.slice(0, 1000) : "";
-    const tags = Array.isArray(body.tags)
-        ? body.tags
-            .filter((tag): tag is string => typeof tag === "string")
-            .map((tag) => tag.trim())
-            .filter((tag) => tag.length > 0)
-            .slice(0, 10)
-        : [];
-
-    const override: TriageOverride = {
-        done,
-        note,
-        tags,
-        updatedAt: new Date().toISOString(),
-    };
-
-    triageOverrides.set(id, override);
-    clearTriageCache();
-    res.json({ message: "ok", id, override });
-});
-
-app.get("/gmail/messages", async (req, res) => {
-    try {
-        const rawLimit = req.query.limit as string | undefined;
-        const limitParse = parseLimit(rawLimit, { fallback: 10, min: 1, max: 100 });
-        if (limitParse.error) {
-            return sendError(res, 400, "BAD_REQUEST", "Invalid query parameter", limitParse.error);
+            logAudit("auth_oauth_success", {
+                redirectedToFrontend: false,
+                userId: user.id,
+                workspaceId: workspace.id,
+                inboxAccountId: inboxAccount.id,
+            });
+            return res.json({
+                message: "OAuth successful",
+                userId: user.id,
+                workspaceId: workspace.id,
+                inboxAccountId: inboxAccount.id,
+            });
+        } catch (err: any) {
+            logAudit("auth_oauth_failed", { reason: err?.message ?? "unknown" });
+            return sendError(res, 500, "INTERNAL_ERROR", err?.message ?? "OAuth failed");
         }
-        const limit = limitParse.value;
-        const pageToken = (req.query.pageToken as string | undefined) || undefined;
-        if (req.query.pageToken !== undefined && typeof req.query.pageToken !== "string") {
-            return sendError(res, 400, "BAD_REQUEST", "Invalid query parameter", "pageToken must be a string");
+    });
+
+    app.get("/auth/status", (req, res) => {
+        const context = oauthTokenRepository.findLatestLinkedContext();
+        const tokens = context ? oauthTokenRepository.findForInboxAccount(context.inboxAccountId) : null;
+        if (!context || !tokens) {
+            return res.json({
+                authenticated: false,
+                hasRefreshToken: false,
+                tokenFilePresent: false,
+                userId: null,
+                workspaceId: null,
+                inboxAccountId: null,
+                user: null,
+            });
         }
 
-        if (!hasGoogleOAuthCredentials()) {
-            return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
+        return res.json({
+            authenticated: true,
+            hasRefreshToken: Boolean(tokens.refresh_token),
+            tokenFilePresent: oauthTokenRepository.tokenRowPresent(),
+            userId: context.userId,
+            workspaceId: context.workspaceId,
+            inboxAccountId: context.inboxAccountId,
+            user: {
+                id: context.userId,
+                email: context.email,
+            },
+        });
+    });
+
+    app.post("/auth/logout", (req, res) => {
+        oauthTokenRepository.clearAll();
+        logAudit("auth_logout");
+        res.json({ message: "logged_out" });
+    });
+
+    app.get("/triage/overrides", (req, res) => {
+        const active = requireActiveGoogleContext(res);
+        if (!active) {
+            return;
         }
 
-        const page = await listEmailMetasPage(limit, pageToken);
+        const items = triageOverrideRepository.listByUser(active.context.userId).map((entry) => ({
+            id: entry.emailId,
+            override: {
+                done: entry.done,
+                note: entry.note,
+                tags: entry.tags,
+                updatedAt: entry.updatedAt,
+            },
+        }));
+        res.json({ message: "ok", items });
+    });
+
+    app.get("/team/inbox", (req, res) => {
+        const active = requireActiveGoogleContext(res);
+        if (!active) {
+            return;
+        }
+
+        const items = triageOverrideRepository.listByUser(active.context.userId).map((entry) => ({
+            emailId: entry.emailId,
+            done: entry.done,
+            note: entry.note,
+            tags: entry.tags,
+            updatedAt: entry.updatedAt,
+        }));
+        res.json({ message: "ok", items });
+    });
+
+    app.get("/admin/rules", (req, res) => {
+        const active = requireActiveGoogleContext(res);
+        if (!active) {
+            return;
+        }
+
         res.json({
             message: "ok",
-            items: page.items,
-            nextPageToken: page.nextPageToken,
+            items: ruleConfigRepository.listAll(),
         });
-    } catch (err: any) {
-        if (err?.status === 401 || err?.code === 401) {
-            return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
-        }
-        sendError(res, 500, "INTERNAL_ERROR", err?.message ?? "Failed to list messages");
-    }
-});
+    });
 
-app.get("/gmail/messages/:id", async (req, res) => {
-    try {
-        if (!hasGoogleOAuthCredentials()) {
-            return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
+    app.post("/admin/rules", (req, res) => {
+        const active = requireActiveGoogleContext(res);
+        if (!active) {
+            return;
+        }
+
+        const body = req.body as Partial<RuleConfig> | undefined;
+        if (!body || typeof body !== "object") {
+            return sendError(res, 400, "BAD_REQUEST", "Invalid rule payload");
+        }
+
+        const name = typeof body.name === "string" && body.name.trim() ? body.name.trim() : "";
+        const description =
+            typeof body.description === "string" && body.description.trim()
+                ? body.description.trim()
+                : "";
+        const priority = body.priority;
+        const category = typeof body.category === "string" ? body.category.trim() : "";
+        const matchers = Array.isArray(body.matchers)
+            ? body.matchers
+                  .filter((matcher): matcher is string => typeof matcher === "string")
+                  .map((matcher) => matcher.trim())
+                  .filter(Boolean)
+            : [];
+        if (!name || !description || !category || !priority || matchers.length === 0) {
+            return sendError(
+                res,
+                400,
+                "BAD_REQUEST",
+                "Rule requires name, description, priority, category, and at least one matcher"
+            );
+        }
+
+        if (!["P0", "P1", "P2", "P3"].includes(priority)) {
+            return sendError(res, 400, "BAD_REQUEST", "Invalid priority");
+        }
+
+        const item: RuleConfig = {
+            id: crypto.randomUUID(),
+            name,
+            description,
+            matchers,
+            priority,
+            category,
+            enabled: body.enabled !== false,
+        };
+
+        ruleConfigRepository.create(item);
+        res.status(201).json({ message: "ok", item });
+    });
+
+    app.get("/feature-flags", (req, res) => {
+        res.json({ message: "ok", flags: featureFlagRepository.get() });
+    });
+
+    app.patch("/feature-flags/ai", (req, res) => {
+        const body = req.body as { aiTriageEnabled?: boolean } | undefined;
+        if (!body || typeof body.aiTriageEnabled !== "boolean") {
+            return sendError(res, 400, "BAD_REQUEST", "aiTriageEnabled boolean is required");
+        }
+
+        const flags = featureFlagRepository.setAiEnabled(body.aiTriageEnabled);
+        res.json({ message: "ok", flags });
+    });
+
+    app.put("/triage/overrides/:id", (req, res) => {
+        const active = requireActiveGoogleContext(res);
+        if (!active) {
+            return;
         }
 
         const id = req.params.id;
         if (!id) {
-            return sendError(res, 400, "BAD_REQUEST", "Missing message id");
+            return sendError(res, 400, "BAD_REQUEST", "Missing email id");
         }
 
-        const item = await getEmailDetail(id);
-        res.json({ message: "ok", item });
-    } catch (err: any) {
-        if (err?.status === 401 || err?.code === 401) {
-            return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
-        }
-        if (err?.status === 404 || err?.code === 404) {
-            return sendError(res, 404, "NOT_FOUND", "Message not found");
-        }
-        sendError(res, 500, "INTERNAL_ERROR", err?.message ?? "Failed to fetch message detail");
-    }
-});
-
-app.get("/triage", async (req, res) => {
-    try {
-        const rawLimit = req.query.limit as string | undefined;
-        const limitParse = parseLimit(rawLimit, { fallback: 10, min: 1, max: 100 });
-        if (limitParse.error) {
-            return sendError(res, 400, "BAD_REQUEST", "Invalid query parameter", limitParse.error);
-        }
-        const limit = limitParse.value;
-        const pageToken = (req.query.pageToken as string | undefined) || undefined;
-        if (req.query.pageToken !== undefined && typeof req.query.pageToken !== "string") {
-            return sendError(res, 400, "BAD_REQUEST", "Invalid query parameter", "pageToken must be a string");
+        const body = req.body as Partial<TriageOverride> | undefined;
+        if (!body || typeof body !== "object") {
+            return sendError(res, 400, "BAD_REQUEST", "Invalid override payload");
         }
 
-        if (!hasGoogleOAuthCredentials()) {
-            return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
+        const done = typeof body.done === "boolean" ? body.done : false;
+        const note = typeof body.note === "string" ? body.note.slice(0, 1000) : "";
+        const tags = Array.isArray(body.tags)
+            ? body.tags
+                  .filter((tag): tag is string => typeof tag === "string")
+                  .map((tag) => tag.trim())
+                  .filter((tag) => tag.length > 0)
+                  .slice(0, 10)
+            : [];
+
+        const override: TriageOverride = {
+            done,
+            note,
+            tags,
+            updatedAt: new Date().toISOString(),
+        };
+
+        triageOverrideRepository.upsert(active.context.userId, { emailId: id, ...override });
+        res.json({ message: "ok", id, override });
+    });
+
+    app.get("/gmail/messages", async (req, res) => {
+        try {
+            const rawLimit = req.query.limit as string | undefined;
+            const limitParse = parseLimit(rawLimit, { fallback: 10, min: 1, max: 100 });
+            if (limitParse.error) {
+                return sendError(res, 400, "BAD_REQUEST", "Invalid query parameter", limitParse.error);
+            }
+            const limit = limitParse.value;
+            const pageToken = (req.query.pageToken as string | undefined) || undefined;
+            if (req.query.pageToken !== undefined && typeof req.query.pageToken !== "string") {
+                return sendError(
+                    res,
+                    400,
+                    "BAD_REQUEST",
+                    "Invalid query parameter",
+                    "pageToken must be a string"
+                );
+            }
+
+            const active = requireActiveGoogleContext(res);
+            if (!active) {
+                return;
+            }
+
+            const page = await listEmailMetasPage(active.tokens, limit, pageToken);
+            res.json({
+                message: "ok",
+                items: page.items,
+                nextPageToken: page.nextPageToken,
+            });
+        } catch (err: any) {
+            if (err?.status === 401 || err?.code === 401) {
+                return sendError(res, 401, "UNAUTHORIZED", "Not authenticated with Google OAuth");
+            }
+            return sendError(res, 500, "INTERNAL_ERROR", err?.message ?? "Failed to list messages");
         }
+    });
 
-        const cacheKey = triageCacheKey(limit, pageToken);
-        const now = Date.now();
-        const cached = triageCache.get(cacheKey);
-        if (cached && cached.expiresAt > now) {
-            return res.json({ message: "ok", items: cached.items });
+    app.get("/gmail/messages/:id", async (req, res) => {
+        try {
+            const id = req.params.id;
+            if (!id) {
+                return sendError(res, 400, "BAD_REQUEST", "Missing message id");
+            }
+
+            const active = requireActiveGoogleContext(res);
+            if (!active) {
+                return;
+            }
+
+            const item = await getEmailDetail(active.tokens, id);
+            res.json({ message: "ok", item });
+        } catch (err: any) {
+            if (err?.status === 401 || err?.code === 401) {
+                return sendError(res, 401, "UNAUTHORIZED", "Not authenticated with Google OAuth");
+            }
+            if (err?.status === 404 || err?.code === 404) {
+                return sendError(res, 404, "NOT_FOUND", "Message not found");
+            }
+            return sendError(res, 500, "INTERNAL_ERROR", err?.message ?? "Failed to fetch message detail");
         }
+    });
 
-        const page = await listEmailMetasPage(limit, pageToken);
-        const emails = page.items;
+    app.get("/triage", async (req, res) => {
+        try {
+            const rawLimit = req.query.limit as string | undefined;
+            const limitParse = parseLimit(rawLimit, { fallback: 10, min: 1, max: 100 });
+            if (limitParse.error) {
+                return sendError(res, 400, "BAD_REQUEST", "Invalid query parameter", limitParse.error);
+            }
+            const limit = limitParse.value;
+            const pageToken = (req.query.pageToken as string | undefined) || undefined;
+            if (req.query.pageToken !== undefined && typeof req.query.pageToken !== "string") {
+                return sendError(
+                    res,
+                    400,
+                    "BAD_REQUEST",
+                    "Invalid query parameter",
+                    "pageToken must be a string"
+                );
+            }
 
-        const items = emails.map((e) => ({
-            email: e,
-            triage: triageEmailRules({
-                subject: e.subject,
-                from: e.from,
-                snippet: e.snippet,
-                date: e.date,
-            }),
-            ...(triageOverrides.has(e.id) ? { override: triageOverrides.get(e.id) } : {}),
-        }));
-        triageCache.set(cacheKey, {
-            expiresAt: now + TRIAGE_CACHE_TTL_MS,
-            items,
-        });
+            const active = requireActiveGoogleContext(res);
+            if (!active) {
+                return;
+            }
 
-        res.json({ message: "ok", items });
-    } catch (err: any) {
-        if (err?.status === 401 || err?.code === 401) {
-            return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
+            const page = await listEmailMetasPage(active.tokens, limit, pageToken);
+            const overrides = triageOverrideRepository.listByUser(active.context.userId);
+            const overrideMap = new Map(overrides.map((entry) => [entry.emailId, entry]));
+
+            const items = page.items.map((e) => ({
+                email: e,
+                triage: triageEmailRules({
+                    subject: e.subject,
+                    from: e.from,
+                    snippet: e.snippet,
+                    date: e.date,
+                }),
+                ...(overrideMap.has(e.id)
+                    ? {
+                          override: {
+                              done: overrideMap.get(e.id)!.done,
+                              note: overrideMap.get(e.id)!.note,
+                              tags: overrideMap.get(e.id)!.tags,
+                              updatedAt: overrideMap.get(e.id)!.updatedAt,
+                          },
+                      }
+                    : {}),
+            }));
+
+            return res.json({ message: "ok", items });
+        } catch (err: any) {
+            if (err?.status === 401 || err?.code === 401) {
+                return sendError(res, 401, "UNAUTHORIZED", "Not authenticated with Google OAuth");
+            }
+            return sendError(res, 500, "INTERNAL_ERROR", err?.message ?? "Triage failed");
         }
-        sendError(res, 500, "INTERNAL_ERROR", err?.message ?? "Triage failed");
-    }
-});
+    });
 
-app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-    if (err instanceof SyntaxError && "body" in err) {
-        return sendError(res, 400, "BAD_REQUEST", "Invalid JSON body");
-    }
-    return next(err);
-});
+    app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+        if (err instanceof SyntaxError && "body" in err) {
+            return sendError(res, 400, "BAD_REQUEST", "Invalid JSON body");
+        }
+        return next(err);
+    });
 
-app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-});
+    return app;
+}
+
+export function startServer() {
+    const app = createApp();
+    return app.listen(PORT, () => {
+        console.log(`Server running on http://localhost:${PORT}`);
+    });
+}
+
+if (require.main === module) {
+    startServer();
+}

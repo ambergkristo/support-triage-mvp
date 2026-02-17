@@ -24,7 +24,10 @@ function hasAuthStatusShape(payload) {
         payload !== null &&
         "authenticated" in payload &&
         "hasRefreshToken" in payload &&
-        "tokenFilePresent" in payload
+        "tokenFilePresent" in payload &&
+        "userId" in payload &&
+        "workspaceId" in payload &&
+        "inboxAccountId" in payload
     );
 }
 
