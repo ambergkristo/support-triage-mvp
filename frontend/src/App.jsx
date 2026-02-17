@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import PostMvpScaffold from "./PostMvpScaffold";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:3000";
 
@@ -338,6 +339,8 @@ export default function App() {
           </aside>
         </div>
       </section>
+
+      <PostMvpScaffold />
     </div>
   );
 }
