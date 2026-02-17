@@ -84,6 +84,14 @@ select {
   padding: 6px;
 }
 
+input,
+textarea {
+  padding: 6px;
+  border: 1px solid #c9d4dc;
+  border-radius: 6px;
+  font: inherit;
+}
+
 .grid {
   display: grid;
   grid-template-columns: 2fr 1fr;
@@ -132,6 +140,37 @@ pre {
 .error {
   color: #b22323;
   font-weight: 600;
+}
+
+.success {
+  color: #155b2b;
+  font-weight: 600;
+}
+
+.info {
+  color: #183b66;
+  font-weight: 500;
+}
+
+.override-box {
+  border: 1px solid #d3dee4;
+  border-radius: 8px;
+  padding: 10px;
+  margin: 10px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: #f8fbfd;
+}
+
+.override-box h4 {
+  margin: 0;
+}
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 @media (max-width: 900px) {
