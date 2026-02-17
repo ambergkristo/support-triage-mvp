@@ -49,6 +49,7 @@ function listFilesRecursive(dir) {
 }
 
 const { triageEmailRules } = require("../src/triageRules.ts");
+const { mergeTokensForPersistence } = require("../src/authTokenPersistence.ts");
 
 const results = [];
 
@@ -141,6 +142,34 @@ results.push(
 );
 
 results.push(
+    test("authTokenPersistence: preserves existing refresh token when Google omits it", () => {
+        const merged = mergeTokensForPersistence({
+            nextTokens: { access_token: "new-access", expiry_date: 2222 },
+            currentTokens: { refresh_token: "keep-me", access_token: "old-access", expiry_date: 1111 },
+            persistedTokens: { refresh_token: "persisted-refresh" },
+        });
+        assertEqual(merged.refresh_token, "keep-me", "Refresh token should be preserved from current token set");
+        assertEqual(merged.access_token, "new-access", "Access token should be updated from nextTokens");
+        assertEqual(merged.expiry_date, 2222, "Expiry should be updated from nextTokens");
+    })
+);
+
+results.push(
+    test("authTokenPersistence: falls back to persisted refresh token", () => {
+        const merged = mergeTokensForPersistence({
+            nextTokens: { access_token: "new-access" },
+            currentTokens: {},
+            persistedTokens: { refresh_token: "persisted-refresh" },
+        });
+        assertEqual(
+            merged.refresh_token,
+            "persisted-refresh",
+            "Persisted refresh token should be used when next/current have none"
+        );
+    })
+);
+
+results.push(
     test("tokenStore: save/load/clear persistence", () => {
         const previousCwd = process.cwd();
         const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "triage-token-store-"));
@@ -152,10 +181,16 @@ results.push(
             const tokenStore = require("../src/tokenStore.ts");
 
             assertEqual(tokenStore.tokenFilePresent(), false, "Token file should not exist before save");
-            tokenStore.saveTokens({ refresh_token: "refresh-123" });
+            tokenStore.saveTokens({
+                refresh_token: "refresh-123",
+                access_token: "access-abc",
+                expiry_date: 9876543210,
+            });
             assertEqual(tokenStore.tokenFilePresent(), true, "Token file should exist after save");
             const loaded = tokenStore.loadTokens();
             assertEqual(loaded?.refresh_token, "refresh-123", "Saved refresh_token should load back");
+            assertEqual(loaded?.access_token, "access-abc", "Saved access_token should load back");
+            assertEqual(loaded?.expiry_date, 9876543210, "Saved expiry_date should load back");
             tokenStore.clearTokens();
             assertEqual(tokenStore.tokenFilePresent(), false, "Token file should be deleted after clear");
         } finally {
