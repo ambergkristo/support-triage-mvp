@@ -14,12 +14,12 @@ import {
 dotenv.config();
 
 const app = express();
-app.use(cors());
 app.use(express.json());
 
 const PORT = Number(process.env.PORT ?? 3000);
 const AUTH_ERROR = "Not authenticated with Google OAuth";
 const FRONTEND_REDIRECT_URL = process.env.FRONTEND_REDIRECT_URL;
+const CORS_ORIGIN = process.env.CORS_ORIGIN;
 const TRIAGE_CACHE_TTL_MS = 30_000;
 
 type ApiErrorCode = "BAD_REQUEST" | "UNAUTHORIZED" | "NOT_FOUND" | "INTERNAL_ERROR";
@@ -46,6 +46,23 @@ type TriageOverride = {
 
 const triageCache = new Map<string, { expiresAt: number; items: TriageItem[] }>();
 const triageOverrides = new Map<string, TriageOverride>();
+
+const allowedOrigins = CORS_ORIGIN
+    ? CORS_ORIGIN.split(",")
+        .map((origin) => origin.trim())
+        .filter((origin) => origin.length > 0)
+    : [];
+
+app.use(
+    cors({
+        origin: (origin, callback) => {
+            if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+                return callback(null, true);
+            }
+            return callback(new Error("CORS origin denied"));
+        },
+    })
+);
 
 function sendError(
     res: express.Response,
