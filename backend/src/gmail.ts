@@ -59,7 +59,18 @@ export function extractPlainTextFromPayload(payload: gmail_v1.Schema$MessagePart
         return decodeBase64Url(payload.body.data);
     }
 
-    for (const part of payload.parts ?? []) {
+    const parts = payload.parts ?? [];
+    for (const part of parts) {
+        if (part.mimeType !== "text/plain") {
+            continue;
+        }
+        const nested = extractPlainTextFromPayload(part);
+        if (nested.trim().length > 0) {
+            return nested;
+        }
+    }
+
+    for (const part of parts) {
         const nested = extractPlainTextFromPayload(part);
         if (nested.trim().length > 0) {
             return nested;
