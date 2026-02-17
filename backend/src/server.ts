@@ -34,9 +34,18 @@ type TriageItem = {
         date: string;
     };
     triage: ReturnType<typeof triageEmailRules>;
+    override?: TriageOverride;
+};
+
+type TriageOverride = {
+    done: boolean;
+    note: string;
+    tags: string[];
+    updatedAt: string;
 };
 
 const triageCache = new Map<string, { expiresAt: number; items: TriageItem[] }>();
+const triageOverrides = new Map<string, TriageOverride>();
 
 function sendError(
     res: express.Response,
@@ -144,7 +153,49 @@ app.post("/auth/logout", (req, res) => {
     oAuth2Client.setCredentials({});
     clearTokens();
     clearTriageCache();
+    triageOverrides.clear();
     res.json({ message: "logged_out" });
+});
+
+app.get("/triage/overrides", (req, res) => {
+    const items = Array.from(triageOverrides.entries()).map(([id, override]) => ({
+        id,
+        override,
+    }));
+    res.json({ message: "ok", items });
+});
+
+app.put("/triage/overrides/:id", (req, res) => {
+    const id = req.params.id;
+    if (!id) {
+        return sendError(res, 400, "BAD_REQUEST", "Missing email id");
+    }
+
+    const body = req.body as Partial<TriageOverride> | undefined;
+    if (!body || typeof body !== "object") {
+        return sendError(res, 400, "BAD_REQUEST", "Invalid override payload");
+    }
+
+    const done = typeof body.done === "boolean" ? body.done : false;
+    const note = typeof body.note === "string" ? body.note.slice(0, 1000) : "";
+    const tags = Array.isArray(body.tags)
+        ? body.tags
+            .filter((tag): tag is string => typeof tag === "string")
+            .map((tag) => tag.trim())
+            .filter((tag) => tag.length > 0)
+            .slice(0, 10)
+        : [];
+
+    const override: TriageOverride = {
+        done,
+        note,
+        tags,
+        updatedAt: new Date().toISOString(),
+    };
+
+    triageOverrides.set(id, override);
+    clearTriageCache();
+    res.json({ message: "ok", id, override });
 });
 
 app.get("/gmail/messages", async (req, res) => {
@@ -237,6 +288,7 @@ app.get("/triage", async (req, res) => {
                 snippet: e.snippet,
                 date: e.date,
             }),
+            ...(triageOverrides.has(e.id) ? { override: triageOverrides.get(e.id) } : {}),
         }));
         triageCache.set(cacheKey, {
             expiresAt: now + TRIAGE_CACHE_TTL_MS,
