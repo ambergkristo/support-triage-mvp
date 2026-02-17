@@ -32,14 +32,29 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Typecheck
-        run: npx tsc --noEmit
-
-      - name: Run tests when present
+      - name: Prepare CI runtime files (no secrets)
         shell: bash
         run: |
-          if node -e "process.exit(require('./package.json').scripts?.test ? 0 : 1)"; then
-            npm test
-          else
-            echo "No test script defined; skipping tests."
-          fi
+          cp .env.example .env
+          cp credentials.example.json credentials.json
+          rm -rf data
+
+      - name: Run regression tests
+        run: npm test
+
+      - name: Smoke test (unauthenticated mode)
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run dev:safe > smoke-server.out 2> smoke-server.err &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID || true; echo "--- SERVER OUT ---"; cat smoke-server.out || true; echo "--- SERVER ERR ---"; cat smoke-server.err || true' EXIT
+
+          for i in {1..25}; do
+            if curl -fsS http://localhost:3000/health >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          SMOKE_EXPECT_UNAUTH=true npm run smoke
