@@ -144,10 +144,6 @@ app.post("/auth/logout", (req, res) => {
 
 app.get("/gmail/messages", async (req, res) => {
     try {
-        if (!hasGoogleOAuthCredentials()) {
-            return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
-        }
-
         const rawLimit = req.query.limit as string | undefined;
         const limitParse = parseLimit(rawLimit, { fallback: 10, min: 1, max: 100 });
         if (limitParse.error) {
@@ -155,6 +151,13 @@ app.get("/gmail/messages", async (req, res) => {
         }
         const limit = limitParse.value;
         const pageToken = (req.query.pageToken as string | undefined) || undefined;
+        if (req.query.pageToken !== undefined && typeof req.query.pageToken !== "string") {
+            return sendError(res, 400, "BAD_REQUEST", "Invalid query parameter", "pageToken must be a string");
+        }
+
+        if (!hasGoogleOAuthCredentials()) {
+            return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
+        }
 
         const page = await listEmailMetasPage(limit, pageToken);
         res.json({
@@ -196,10 +199,6 @@ app.get("/gmail/messages/:id", async (req, res) => {
 
 app.get("/triage", async (req, res) => {
     try {
-        if (!hasGoogleOAuthCredentials()) {
-            return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
-        }
-
         const rawLimit = req.query.limit as string | undefined;
         const limitParse = parseLimit(rawLimit, { fallback: 10, min: 1, max: 100 });
         if (limitParse.error) {
@@ -207,6 +206,14 @@ app.get("/triage", async (req, res) => {
         }
         const limit = limitParse.value;
         const pageToken = (req.query.pageToken as string | undefined) || undefined;
+        if (req.query.pageToken !== undefined && typeof req.query.pageToken !== "string") {
+            return sendError(res, 400, "BAD_REQUEST", "Invalid query parameter", "pageToken must be a string");
+        }
+
+        if (!hasGoogleOAuthCredentials()) {
+            return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
+        }
+
         const cacheKey = triageCacheKey(limit, pageToken);
         const now = Date.now();
         const cached = triageCache.get(cacheKey);
