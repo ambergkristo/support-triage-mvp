@@ -44,8 +44,43 @@ type TriageOverride = {
     updatedAt: string;
 };
 
+type RuleConfig = {
+    id: string;
+    name: string;
+    description: string;
+    matchers: string[];
+    priority: "P0" | "P1" | "P2" | "P3";
+    category: string;
+    enabled: boolean;
+};
+
+type FeatureFlags = {
+    aiTriageEnabled: boolean;
+    aiMode: "disabled" | "shadow";
+    safeFallback: "rules";
+};
+
 const triageCache = new Map<string, { expiresAt: number; items: TriageItem[] }>();
 const triageOverrides = new Map<string, TriageOverride>();
+const ruleConfigs = new Map<string, RuleConfig>([
+    [
+        "rule-security-1",
+        {
+            id: "rule-security-1",
+            name: "Security alerts",
+            description: "Escalate suspicious and verification-related messages.",
+            matchers: ["verification code", "security alert", "suspicious"],
+            priority: "P0",
+            category: "security",
+            enabled: true,
+        },
+    ],
+]);
+const featureFlags: FeatureFlags = {
+    aiTriageEnabled: false,
+    aiMode: "disabled",
+    safeFallback: "rules",
+};
 
 const allowedOrigins = CORS_ORIGIN
     ? CORS_ORIGIN.split(",")
@@ -211,6 +246,97 @@ app.get("/triage/overrides", (req, res) => {
         override,
     }));
     res.json({ message: "ok", items });
+});
+
+app.get("/team/inbox", (req, res) => {
+    if (!hasGoogleOAuthCredentials()) {
+        return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
+    }
+
+    const items = Array.from(triageOverrides.entries()).map(([id, override]) => ({
+        emailId: id,
+        done: override.done,
+        note: override.note,
+        tags: override.tags,
+        updatedAt: override.updatedAt,
+    }));
+    res.json({ message: "ok", items });
+});
+
+app.get("/admin/rules", (req, res) => {
+    if (!hasGoogleOAuthCredentials()) {
+        return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
+    }
+
+    res.json({
+        message: "ok",
+        items: Array.from(ruleConfigs.values()),
+    });
+});
+
+app.post("/admin/rules", (req, res) => {
+    if (!hasGoogleOAuthCredentials()) {
+        return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
+    }
+
+    const body = req.body as Partial<RuleConfig> | undefined;
+    if (!body || typeof body !== "object") {
+        return sendError(res, 400, "BAD_REQUEST", "Invalid rule payload");
+    }
+
+    const name = typeof body.name === "string" && body.name.trim() ? body.name.trim() : "";
+    const description =
+        typeof body.description === "string" && body.description.trim() ? body.description.trim() : "";
+    const priority = body.priority;
+    const category = typeof body.category === "string" ? body.category.trim() : "";
+    const matchers = Array.isArray(body.matchers)
+        ? body.matchers
+            .filter((matcher): matcher is string => typeof matcher === "string")
+            .map((matcher) => matcher.trim())
+            .filter(Boolean)
+        : [];
+    if (!name || !description || !category || !priority || matchers.length === 0) {
+        return sendError(
+            res,
+            400,
+            "BAD_REQUEST",
+            "Rule requires name, description, priority, category, and at least one matcher"
+        );
+    }
+
+    if (!["P0", "P1", "P2", "P3"].includes(priority)) {
+        return sendError(res, 400, "BAD_REQUEST", "Invalid priority");
+    }
+
+    const id = `rule-${Date.now()}`;
+    const item: RuleConfig = {
+        id,
+        name,
+        description,
+        matchers,
+        priority,
+        category,
+        enabled: body.enabled !== false,
+    };
+
+    ruleConfigs.set(id, item);
+    res.status(201).json({ message: "ok", item });
+});
+
+app.get("/feature-flags", (req, res) => {
+    res.json({ message: "ok", flags: featureFlags });
+});
+
+app.patch("/feature-flags/ai", (req, res) => {
+    const body = req.body as Partial<FeatureFlags> | undefined;
+    if (!body || typeof body.aiTriageEnabled !== "boolean") {
+        return sendError(res, 400, "BAD_REQUEST", "aiTriageEnabled boolean is required");
+    }
+
+    featureFlags.aiTriageEnabled = body.aiTriageEnabled;
+    featureFlags.aiMode = featureFlags.aiTriageEnabled ? "shadow" : "disabled";
+    featureFlags.safeFallback = "rules";
+    res.json({ message: "ok", flags: featureFlags });
 });
 
 app.put("/triage/overrides/:id", (req, res) => {
