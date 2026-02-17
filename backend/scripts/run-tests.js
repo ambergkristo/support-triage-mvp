@@ -276,10 +276,12 @@ results.push(
 results.push(
     test("tokenStore: save/load/clear persistence", () => {
         const previousCwd = process.cwd();
+        const previousEncryptionKey = process.env.TOKEN_ENCRYPTION_KEY;
         const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "triage-token-store-"));
 
         try {
             process.chdir(tmpRoot);
+            delete process.env.TOKEN_ENCRYPTION_KEY;
             const tokenStorePath = require.resolve("../src/tokenStore.ts");
             delete require.cache[tokenStorePath];
             const tokenStore = require("../src/tokenStore.ts");
@@ -298,6 +300,50 @@ results.push(
             tokenStore.clearTokens();
             assertEqual(tokenStore.tokenFilePresent(), false, "Token file should be deleted after clear");
         } finally {
+            if (previousEncryptionKey === undefined) {
+                delete process.env.TOKEN_ENCRYPTION_KEY;
+            } else {
+                process.env.TOKEN_ENCRYPTION_KEY = previousEncryptionKey;
+            }
+            process.chdir(previousCwd);
+            fs.rmSync(tmpRoot, { recursive: true, force: true });
+        }
+    })
+);
+
+results.push(
+    test("tokenStore: encrypts token file when TOKEN_ENCRYPTION_KEY is set", () => {
+        const previousCwd = process.cwd();
+        const previousEncryptionKey = process.env.TOKEN_ENCRYPTION_KEY;
+        const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "triage-token-store-encrypted-"));
+
+        try {
+            process.chdir(tmpRoot);
+            process.env.TOKEN_ENCRYPTION_KEY = "unit-test-encryption-key";
+
+            const tokenStorePath = require.resolve("../src/tokenStore.ts");
+            delete require.cache[tokenStorePath];
+            const tokenStore = require("../src/tokenStore.ts");
+
+            tokenStore.saveTokens({
+                refresh_token: "refresh-secure",
+                access_token: "access-secure",
+                expiry_date: 1122334455,
+            });
+
+            const tokenFilePath = path.join(tmpRoot, "data", "token.json");
+            const raw = fs.readFileSync(tokenFilePath, "utf-8");
+            assertTrue(!raw.includes("refresh-secure"), "Encrypted token file must not contain plaintext token values");
+
+            const loaded = tokenStore.loadTokens();
+            assertEqual(loaded?.refresh_token, "refresh-secure", "Encrypted token payload should decrypt correctly");
+            tokenStore.clearTokens();
+        } finally {
+            if (previousEncryptionKey === undefined) {
+                delete process.env.TOKEN_ENCRYPTION_KEY;
+            } else {
+                process.env.TOKEN_ENCRYPTION_KEY = previousEncryptionKey;
+            }
             process.chdir(previousCwd);
             fs.rmSync(tmpRoot, { recursive: true, force: true });
         }

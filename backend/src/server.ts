@@ -64,6 +64,19 @@ app.use(
     })
 );
 
+app.use((req, res, next) => {
+    const startedAt = Date.now();
+    res.on("finish", () => {
+        logAudit("http_request", {
+            method: req.method,
+            path: req.originalUrl,
+            status: res.statusCode,
+            durationMs: Date.now() - startedAt,
+        });
+    });
+    next();
+});
+
 function sendError(
     res: express.Response,
     status: number,
@@ -104,6 +117,16 @@ function triageCacheKey(limit: number, pageToken?: string): string {
 
 function clearTriageCache() {
     triageCache.clear();
+}
+
+function logAudit(event: string, fields: Record<string, unknown> = {}) {
+    console.log(
+        JSON.stringify({
+            ts: new Date().toISOString(),
+            event,
+            ...fields,
+        })
+    );
 }
 
 function hasGoogleOAuthCredentials() {
@@ -148,11 +171,14 @@ app.get("/oauth2callback", async (req, res) => {
         const emails = await listEmailMetas(10);
 
         if (FRONTEND_REDIRECT_URL) {
+            logAudit("auth_oauth_success", { redirectedToFrontend: true });
             return res.redirect(`${FRONTEND_REDIRECT_URL}?oauth=success`);
         }
 
+        logAudit("auth_oauth_success", { redirectedToFrontend: false });
         res.json({ message: "OAuth successful", emails });
     } catch (err: any) {
+        logAudit("auth_oauth_failed", { reason: err?.message ?? "unknown" });
         sendError(res, 500, "INTERNAL_ERROR", err?.message ?? "OAuth failed");
     }
 });
@@ -171,6 +197,7 @@ app.post("/auth/logout", (req, res) => {
     clearTokens();
     clearTriageCache();
     triageOverrides.clear();
+    logAudit("auth_logout");
     res.json({ message: "logged_out" });
 });
 
