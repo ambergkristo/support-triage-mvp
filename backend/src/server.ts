@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { getAuthUrl, oAuth2Client, listEmailMetas } from "./gmail";
+import { getAuthUrl, oAuth2Client, listEmailMetas, listEmailMetasPage, getEmailDetail } from "./gmail";
 import { triageEmailRules } from "./triageRules";
 import { mergeTokensForPersistence } from "./authTokenPersistence";
 import {
@@ -77,6 +77,55 @@ app.post("/auth/logout", (req, res) => {
     oAuth2Client.setCredentials({});
     clearTokens();
     res.json({ message: "logged_out" });
+});
+
+app.get("/gmail/messages", async (req, res) => {
+    try {
+        if (!hasGoogleOAuthCredentials()) {
+            return res.status(401).json({ error: AUTH_ERROR });
+        }
+
+        const rawLimit = req.query.limit as string | undefined;
+        const parsedLimit = rawLimit ? Number(rawLimit) : 10;
+        const limit = Number.isInteger(parsedLimit) && parsedLimit > 0 && parsedLimit <= 100 ? parsedLimit : 10;
+        const pageToken = (req.query.pageToken as string | undefined) || undefined;
+
+        const page = await listEmailMetasPage(limit, pageToken);
+        res.json({
+            message: "ok",
+            items: page.items,
+            nextPageToken: page.nextPageToken,
+        });
+    } catch (err: any) {
+        if (err?.status === 401 || err?.code === 401) {
+            return res.status(401).json({ error: AUTH_ERROR });
+        }
+        res.status(500).json({ error: err?.message ?? "Failed to list messages" });
+    }
+});
+
+app.get("/gmail/messages/:id", async (req, res) => {
+    try {
+        if (!hasGoogleOAuthCredentials()) {
+            return res.status(401).json({ error: AUTH_ERROR });
+        }
+
+        const id = req.params.id;
+        if (!id) {
+            return res.status(400).json({ error: "Missing message id" });
+        }
+
+        const item = await getEmailDetail(id);
+        res.json({ message: "ok", item });
+    } catch (err: any) {
+        if (err?.status === 401 || err?.code === 401) {
+            return res.status(401).json({ error: AUTH_ERROR });
+        }
+        if (err?.status === 404 || err?.code === 404) {
+            return res.status(404).json({ error: "Message not found" });
+        }
+        res.status(500).json({ error: err?.message ?? "Failed to fetch message detail" });
+    }
 });
 
 app.get("/triage", async (req, res) => {
