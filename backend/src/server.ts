@@ -19,6 +19,7 @@ app.use(express.json());
 
 const PORT = Number(process.env.PORT ?? 3000);
 const AUTH_ERROR = "Not authenticated with Google OAuth";
+const FRONTEND_REDIRECT_URL = process.env.FRONTEND_REDIRECT_URL;
 const TRIAGE_CACHE_TTL_MS = 30_000;
 
 type ApiErrorCode = "BAD_REQUEST" | "UNAUTHORIZED" | "NOT_FOUND" | "INTERNAL_ERROR";
@@ -119,6 +120,10 @@ app.get("/oauth2callback", async (req, res) => {
         clearTriageCache();
 
         const emails = await listEmailMetas(10);
+
+        if (FRONTEND_REDIRECT_URL) {
+            return res.redirect(`${FRONTEND_REDIRECT_URL}?oauth=success`);
+        }
 
         res.json({ message: "OAuth successful", emails });
     } catch (err: any) {
