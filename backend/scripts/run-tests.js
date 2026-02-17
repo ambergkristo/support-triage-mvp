@@ -50,8 +50,55 @@ function listFilesRecursive(dir) {
 
 const { triageEmailRules } = require("../src/triageRules.ts");
 const { mergeTokensForPersistence } = require("../src/authTokenPersistence.ts");
+const { extractPlainTextFromPayload } = require("../src/gmail.ts");
 
 const results = [];
+
+results.push(
+    test("gmail payload extraction: top-level plain text", () => {
+        const payload = {
+            mimeType: "text/plain",
+            body: {
+                data: Buffer.from("Hello plain text", "utf-8")
+                    .toString("base64")
+                    .replace(/\+/g, "-")
+                    .replace(/\//g, "_"),
+            },
+        };
+        const text = extractPlainTextFromPayload(payload);
+        assertEqual(text, "Hello plain text", "Should decode top-level plain text payload");
+    })
+);
+
+results.push(
+    test("gmail payload extraction: nested multipart plain text fallback", () => {
+        const payload = {
+            mimeType: "multipart/alternative",
+            parts: [
+                {
+                    mimeType: "text/html",
+                    body: {
+                        data: Buffer.from("<p>HTML</p>", "utf-8")
+                            .toString("base64")
+                            .replace(/\+/g, "-")
+                            .replace(/\//g, "_"),
+                    },
+                },
+                {
+                    mimeType: "text/plain",
+                    body: {
+                        data: Buffer.from("Nested plain text", "utf-8")
+                            .toString("base64")
+                            .replace(/\+/g, "-")
+                            .replace(/\//g, "_"),
+                    },
+                },
+            ],
+        };
+        const text = extractPlainTextFromPayload(payload);
+        assertEqual(text, "Nested plain text", "Should prefer nested text/plain payload");
+    })
+);
 
 results.push(
     test("triageRules: github sender domain maps to operations", () => {
