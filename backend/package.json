@@ -7,7 +7,8 @@
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "dev:safe": "ts-node --transpile-only src/server.ts",
     "test": "node scripts/run-tests.js",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "qa:restart-auth": "powershell -ExecutionPolicy Bypass -File ./scripts/check-restart-auth.ps1"
   },
   "keywords": [],
   "author": "",
