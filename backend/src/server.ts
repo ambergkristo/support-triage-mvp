@@ -19,6 +19,65 @@ app.use(express.json());
 
 const PORT = Number(process.env.PORT ?? 3000);
 const AUTH_ERROR = "Not authenticated with Google OAuth";
+const TRIAGE_CACHE_TTL_MS = 30_000;
+
+type ApiErrorCode = "BAD_REQUEST" | "UNAUTHORIZED" | "NOT_FOUND" | "INTERNAL_ERROR";
+
+type TriageItem = {
+    email: {
+        id: string;
+        threadId: string;
+        snippet: string;
+        subject: string;
+        from: string;
+        date: string;
+    };
+    triage: ReturnType<typeof triageEmailRules>;
+};
+
+const triageCache = new Map<string, { expiresAt: number; items: TriageItem[] }>();
+
+function sendError(
+    res: express.Response,
+    status: number,
+    code: ApiErrorCode,
+    message: string,
+    details?: string
+) {
+    return res.status(status).json({
+        message: "error",
+        error: {
+            code,
+            message,
+            ...(details ? { details } : {}),
+        },
+    });
+}
+
+function parseLimit(
+    rawLimit: string | undefined,
+    options: { fallback: number; min: number; max: number }
+): { value: number; error?: string } {
+    const { fallback, min, max } = options;
+    if (rawLimit === undefined) {
+        return { value: fallback };
+    }
+
+    const parsed = Number(rawLimit);
+    if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+        return { value: fallback, error: `limit must be an integer between ${min} and ${max}` };
+    }
+
+    return { value: parsed };
+}
+
+function triageCacheKey(limit: number, pageToken?: string): string {
+    return `${limit}:${pageToken ?? ""}`;
+}
+
+function clearTriageCache() {
+    triageCache.clear();
+}
 
 function hasGoogleOAuthCredentials() {
     const creds = oAuth2Client.credentials;
@@ -45,7 +104,9 @@ app.get("/auth/google", (req, res) => {
 app.get("/oauth2callback", async (req, res) => {
     try {
         const code = req.query.code as string | undefined;
-        if (!code) return res.status(400).json({ error: "Missing code" });
+        if (!code) {
+            return sendError(res, 400, "BAD_REQUEST", "Missing code");
+        }
 
         const { tokens } = await oAuth2Client.getToken(code);
         const mergedTokens = mergeTokensForPersistence({
@@ -55,12 +116,13 @@ app.get("/oauth2callback", async (req, res) => {
         });
         oAuth2Client.setCredentials(mergedTokens);
         saveTokens(mergedTokens);
+        clearTriageCache();
 
         const emails = await listEmailMetas(10);
 
         res.json({ message: "OAuth successful", emails });
     } catch (err: any) {
-        res.status(500).json({ error: err?.message ?? "OAuth failed" });
+        sendError(res, 500, "INTERNAL_ERROR", err?.message ?? "OAuth failed");
     }
 });
 
@@ -76,19 +138,26 @@ app.get("/auth/status", (req, res) => {
 app.post("/auth/logout", (req, res) => {
     oAuth2Client.setCredentials({});
     clearTokens();
+    clearTriageCache();
     res.json({ message: "logged_out" });
 });
 
 app.get("/gmail/messages", async (req, res) => {
     try {
-        if (!hasGoogleOAuthCredentials()) {
-            return res.status(401).json({ error: AUTH_ERROR });
+        const rawLimit = req.query.limit as string | undefined;
+        const limitParse = parseLimit(rawLimit, { fallback: 10, min: 1, max: 100 });
+        if (limitParse.error) {
+            return sendError(res, 400, "BAD_REQUEST", "Invalid query parameter", limitParse.error);
+        }
+        const limit = limitParse.value;
+        const pageToken = (req.query.pageToken as string | undefined) || undefined;
+        if (req.query.pageToken !== undefined && typeof req.query.pageToken !== "string") {
+            return sendError(res, 400, "BAD_REQUEST", "Invalid query parameter", "pageToken must be a string");
         }
 
-        const rawLimit = req.query.limit as string | undefined;
-        const parsedLimit = rawLimit ? Number(rawLimit) : 10;
-        const limit = Number.isInteger(parsedLimit) && parsedLimit > 0 && parsedLimit <= 100 ? parsedLimit : 10;
-        const pageToken = (req.query.pageToken as string | undefined) || undefined;
+        if (!hasGoogleOAuthCredentials()) {
+            return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
+        }
 
         const page = await listEmailMetasPage(limit, pageToken);
         res.json({
@@ -98,47 +167,62 @@ app.get("/gmail/messages", async (req, res) => {
         });
     } catch (err: any) {
         if (err?.status === 401 || err?.code === 401) {
-            return res.status(401).json({ error: AUTH_ERROR });
+            return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
         }
-        res.status(500).json({ error: err?.message ?? "Failed to list messages" });
+        sendError(res, 500, "INTERNAL_ERROR", err?.message ?? "Failed to list messages");
     }
 });
 
 app.get("/gmail/messages/:id", async (req, res) => {
     try {
         if (!hasGoogleOAuthCredentials()) {
-            return res.status(401).json({ error: AUTH_ERROR });
+            return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
         }
 
         const id = req.params.id;
         if (!id) {
-            return res.status(400).json({ error: "Missing message id" });
+            return sendError(res, 400, "BAD_REQUEST", "Missing message id");
         }
 
         const item = await getEmailDetail(id);
         res.json({ message: "ok", item });
     } catch (err: any) {
         if (err?.status === 401 || err?.code === 401) {
-            return res.status(401).json({ error: AUTH_ERROR });
+            return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
         }
         if (err?.status === 404 || err?.code === 404) {
-            return res.status(404).json({ error: "Message not found" });
+            return sendError(res, 404, "NOT_FOUND", "Message not found");
         }
-        res.status(500).json({ error: err?.message ?? "Failed to fetch message detail" });
+        sendError(res, 500, "INTERNAL_ERROR", err?.message ?? "Failed to fetch message detail");
     }
 });
 
 app.get("/triage", async (req, res) => {
     try {
-        if (!hasGoogleOAuthCredentials()) {
-            return res.status(401).json({ error: AUTH_ERROR });
+        const rawLimit = req.query.limit as string | undefined;
+        const limitParse = parseLimit(rawLimit, { fallback: 10, min: 1, max: 100 });
+        if (limitParse.error) {
+            return sendError(res, 400, "BAD_REQUEST", "Invalid query parameter", limitParse.error);
+        }
+        const limit = limitParse.value;
+        const pageToken = (req.query.pageToken as string | undefined) || undefined;
+        if (req.query.pageToken !== undefined && typeof req.query.pageToken !== "string") {
+            return sendError(res, 400, "BAD_REQUEST", "Invalid query parameter", "pageToken must be a string");
         }
 
-        const rawLimit = req.query.limit as string | undefined;
-        const parsedLimit = rawLimit ? Number(rawLimit) : 10;
-        const limit = Number.isInteger(parsedLimit) && parsedLimit > 0 ? parsedLimit : 10;
+        if (!hasGoogleOAuthCredentials()) {
+            return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
+        }
 
-        const emails = await listEmailMetas(limit);
+        const cacheKey = triageCacheKey(limit, pageToken);
+        const now = Date.now();
+        const cached = triageCache.get(cacheKey);
+        if (cached && cached.expiresAt > now) {
+            return res.json({ message: "ok", items: cached.items });
+        }
+
+        const page = await listEmailMetasPage(limit, pageToken);
+        const emails = page.items;
 
         const items = emails.map((e) => ({
             email: e,
@@ -149,13 +233,17 @@ app.get("/triage", async (req, res) => {
                 date: e.date,
             }),
         }));
+        triageCache.set(cacheKey, {
+            expiresAt: now + TRIAGE_CACHE_TTL_MS,
+            items,
+        });
 
         res.json({ message: "ok", items });
     } catch (err: any) {
         if (err?.status === 401 || err?.code === 401) {
-            return res.status(401).json({ error: AUTH_ERROR });
+            return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
         }
-        res.status(500).json({ error: err?.message ?? "Triage failed" });
+        sendError(res, 500, "INTERNAL_ERROR", err?.message ?? "Triage failed");
     }
 });
 
