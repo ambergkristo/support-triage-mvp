@@ -158,6 +158,10 @@ app.post("/auth/logout", (req, res) => {
 });
 
 app.get("/triage/overrides", (req, res) => {
+    if (!hasGoogleOAuthCredentials()) {
+        return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
+    }
+
     const items = Array.from(triageOverrides.entries()).map(([id, override]) => ({
         id,
         override,
@@ -166,6 +170,10 @@ app.get("/triage/overrides", (req, res) => {
 });
 
 app.put("/triage/overrides/:id", (req, res) => {
+    if (!hasGoogleOAuthCredentials()) {
+        return sendError(res, 401, "UNAUTHORIZED", AUTH_ERROR);
+    }
+
     const id = req.params.id;
     if (!id) {
         return sendError(res, 400, "BAD_REQUEST", "Missing email id");
@@ -302,6 +310,13 @@ app.get("/triage", async (req, res) => {
         }
         sendError(res, 500, "INTERNAL_ERROR", err?.message ?? "Triage failed");
     }
+});
+
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (err instanceof SyntaxError && "body" in err) {
+        return sendError(res, 400, "BAD_REQUEST", "Invalid JSON body");
+    }
+    return next(err);
 });
 
 app.listen(PORT, () => {
