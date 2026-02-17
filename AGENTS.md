@@ -21,6 +21,24 @@
 3. Install and run:
    - `cd backend`
    - `npm ci`
-   - `npm run dev`
+   - `npm run dev:safe`
 4. Optional sanity check:
    - Open `http://localhost:3000/auth/google`
+
+## Architecture Decisions
+- Product direction is now `OpsInbox` (B2B operational inbox), not a demo MVP.
+- Source layering standard inside backend:
+  - `src/api`
+  - `src/application`
+  - `src/domain`
+  - `src/infrastructure`
+- Deterministic triage remains default; any future AI mode must be feature-flagged with safe rules fallback.
+
+## Mistakes Found
+- Previous stacked PR sequence was merged partially, causing missing milestone changes on `main`.
+- Repo had dead/duplicate folders (`untitled/`, `backend/backend/`) that created path confusion.
+
+## Anti-Patterns To Avoid
+- Keeping operational state only in memory.
+- Mixing API routes, domain logic, and infrastructure clients in a single file without boundaries.
+- Relying on implicit production defaults for security-sensitive config.

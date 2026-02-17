@@ -1,12 +1,17 @@
-# Post-MVP Backlog
+# OpsInbox Backlog
 
-1. Add persistent user identity model and session auth middleware.
-2. Persist team inbox assignments in DB (not in-memory).
-3. Add rules CRUD (update/delete/reorder) with validation and versioning.
-4. Add Rules Admin page with test-run simulation against sample email.
-5. Add team inbox board (new/in_progress/blocked/done).
-6. Add AI shadow mode collector (store AI output without affecting response).
-7. Add feature-flag admin auth and change history.
-8. Add per-workspace CORS + OAuth redirect management.
-9. Add compliance export endpoint for audit logs.
-10. Add end-to-end tests for login -> triage -> override -> team assignment.
+## Immediate (Execution)
+1. M2: Add SQLite migration runner and durable schema (`users`, `inbox_accounts`, `messages`, `triage_results`, `assignments`, `notes`, `activity_log`, `rule_configs`, `feature_flags`).
+2. M2: Replace in-memory overrides/rules/flags with SQLite repositories.
+3. M2: Persist triage outputs and message metadata for restart-safe recovery.
+4. M3: Add multi-user auth abstraction and workspace linkage.
+5. M4: Assignment ownership + status workflow persistence.
+6. M5: SLA escalation engine and Slack webhook adapter.
+7. M6: Audit retrieval endpoints and admin activity views.
+8. M7: Production middleware (rate limiting, security headers) and release image hardening.
+9. M8: Plan limits and feature gating for monetizable tiers.
+
+## Later
+1. Rules simulation UI for admins.
+2. AI shadow mode quality dashboard.
+3. Compliance export package for enterprise buyers.
