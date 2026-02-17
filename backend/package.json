@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
-    "dev:safe": "ts-node --transpile-only src/server.ts"
+    "dev:safe": "ts-node --transpile-only src/server.ts",
+    "test": "node scripts/run-tests.js"
   },
   "keywords": [],
   "author": "",
@@ -17,7 +18,6 @@
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "googleapis": "^171.4.0",
-    "openai": "^6.22.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
