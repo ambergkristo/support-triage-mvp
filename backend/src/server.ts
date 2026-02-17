@@ -2,7 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { getAuthUrl, oAuth2Client, listEmailMetas } from "./gmail";
-import { analyzeEmail } from "./ai";
+import { triageEmailRules } from "./triageRules";
 import {
     clearTokens,
     loadTokens,
@@ -103,16 +103,15 @@ app.get("/triage", async (req, res) => {
 
         const emails = await listEmailMetas(limit);
 
-        const items = await Promise.all(
-            emails.map(async (e) => ({
-                email: e,
-                triage: await analyzeEmail({
-                    subject: e.subject,
-                    from: e.from,
-                    snippet: e.snippet,
-                }),
-            }))
-        );
+        const items = emails.map((e) => ({
+            email: e,
+            triage: triageEmailRules({
+                subject: e.subject,
+                from: e.from,
+                snippet: e.snippet,
+                date: e.date,
+            }),
+        }));
 
         res.json({ message: "ok", items });
     } catch (err: any) {
